@@ -8,7 +8,7 @@ workspace/
   js-mutator/
 ```
 
-V8's internal parser API and GN configuration change between revisions. The GN bridge below was compiled and smoke tested on one Linux x64 checkout; a fresh clone may need toolchain-specific adjustments.
+V8's internal parser API and GN configuration change between revisions. On 2026-11-19 the source set below, including `src/generator.cc`, was compiled with V8's Clang and Chromium style plugin and fuzzed on the lab checkout (V8 12.5, Linux x64). The plugin requires out-of-line special members for non-trivial structs, which `generator.cc` provides.
 
 ## Prepare the sources
 
@@ -34,6 +34,7 @@ source_set("js_mutator_for_fuzzing") {
     "test/fuzzer/js_mutator_external/build/_deps/tree_sitter_javascript-src/src/parser.c",
     "test/fuzzer/js_mutator_external/build/_deps/tree_sitter_javascript-src/src/scanner.c",
     "test/fuzzer/js_mutator_external/build/_deps/tree_sitter_runtime-src/lib/src/lib.c",
+    "test/fuzzer/js_mutator_external/src/generator.cc",
     "test/fuzzer/js_mutator_external/src/mutator.cc",
   ]
   include_dirs = [
@@ -96,4 +97,13 @@ bool IsValidInput(const uint8_t*, size_t size) { return size <= 2048; }
 
 The adapter defaults to 90% valid-leaning edits. Set `JS_MUTATOR_VALID_PERCENT` to an integer from 0 to 100 before launch to change the mix.
 
-The adapter does not read a token file or call `LLVMFuzzerMutate`, so `-dict` does not guide its edits. libFuzzer guides the search by retaining and reusing coverage-increasing corpus inputs; the callback does not receive coverage directly.
+The adapter also exports `LLVMFuzzerCustomCrossOver`, which libFuzzer uses in place of its byte-level crossover. The JavaScript vocabulary is compiled in, so `-dict` is unnecessary. Use `-max_len=2048` (or `JS_MUTATOR_MAX_LEN=2048`) with a harness that skips longer inputs.
+
+To compare against libFuzzer's built-in mutations with the same binary and equal time, run two copies of the corpus:
+
+```sh
+JS_MUTATOR_DEFAULT_PERCENT=0   out/x64.lab-libfuzzer/v8_lab_parser_libfuzzer mut -max_total_time=600 -max_len=2048
+JS_MUTATOR_DEFAULT_PERCENT=100 out/x64.lab-libfuzzer/v8_lab_parser_libfuzzer def -max_total_time=600 -max_len=2048 -cross_over=0
+```
+
+`-cross_over=0` keeps the baseline free of js-mutator's crossover.

@@ -1,22 +1,27 @@
 # js-mutator
 
-A standalone JavaScript source mutator for different fuzzing harnesses. It provides a C++ core and a libFuzzer custom-mutator adapter.
+A libFuzzer custom mutator for JavaScript parsers. Its JavaScript tokens and grammar rules are compiled in. It generates new programs from empty input and transforms corpus seeds, using the seed's own in-scope variables and expressions, into more varied and deeply nested JavaScript. Output is valid by default, with an optional mode that breaks it deliberately.
 
-**Status:** first implementation. The core makes bounded, seed-based source edits and uses Tree-sitter to check valid-leaning candidates. A V8 parser smoke test succeeded; target-parser acceptance rates and comparative coverage gains remain unmeasured.
-
-- [Requirements](docs/REQUIREMENTS.md)
-- [Design proposal](docs/DESIGN.md)
-- [Verification record](docs/TESTING.md)
-- [V8 parser integration](docs/V8_INTEGRATION.md)
+- [Requirements](docs/REQUIREMENTS.md) · [Design](docs/DESIGN.md) · [Verification](docs/TESTING.md) · [V8 integration](docs/V8_INTEGRATION.md)
 
 ## Build and test
 
-Requires CMake 3.18 or newer, a C and C++17 compiler, and Git. Configuration downloads pinned Tree-sitter sources.
+Requires CMake 3.18+, a C/C++17 compiler, and Git (configuration downloads pinned Tree-sitter sources).
 
 ```sh
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j8
 (cd build && ctest --output-on-failure)
 ```
 
-The `js_mutator` static library has no libFuzzer dependency. The optional `js_mutator_libfuzzer` object target exports `LLVMFuzzerCustomMutator` for a harness that supplies `LLVMFuzzerTestOneInput`. The adapter defaults to 90% valid-leaning edits; set `JS_MUTATOR_VALID_PERCENT` to an integer from 0 to 100 to change the mix.
+CTest runs the interface contract, the end-goal generation checks, and the adapter test. If Node.js is installed, it also checks acceptance with V8's own parser (`js_mutator_v8_parse_test`).
+
+## libFuzzer adapter
+
+`adapters/libfuzzer.cc` exports `LLVMFuzzerCustomMutator` and `LLVMFuzzerCustomCrossOver`. Environment variables, read once at startup:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `JS_MUTATOR_VALID_PERCENT` | 90 | Share of calls in valid-leaning mode; the rest are deliberately malformed |
+| `JS_MUTATOR_MAX_LEN` | 0 (off) | Output cap below libFuzzer's `max_len`, e.g. 2048 for a harness that skips longer inputs |
+| `JS_MUTATOR_DEFAULT_PERCENT` | 0 | Share of calls given to libFuzzer's built-in byte mutator (Linux/ELF only). 100 gives an A/B baseline from the same binary; also pass `-cross_over=0` |

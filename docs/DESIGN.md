@@ -1,105 +1,67 @@
-# JavaScript mutator — design proposal
+# JavaScript mutator: design
 
-**Status:** first implementation in progress.
+## Goal
 
-## Goal and first integration
-
-The project is a standalone C++ library that turns a JavaScript seed program into a related candidate program. A small libFuzzer adapter will call it from `LLVMFuzzerCustomMutator`. The library will have no dependency on the target engine or its harness.
-
-The first milestone is deliberately narrow: generate useful structural edits from real seed programs, keep output within `MaxSize`, reproduce mutations from a fixed seed, and measure how often the target parser accepts the result. Broader ECMAScript coverage follows from measured gaps.
+Generate and transform JavaScript so that coverage-guided fuzzing can reach every part of a JavaScript parser. Correct code is the default; deliberately broken code is a separate mode. The core is a C++ library with no engine dependency; `adapters/libfuzzer.cc` connects it to libFuzzer.
 
 ## Data flow
 
 ```text
-libFuzzer corpus parent
-        │
-        ▼
-libFuzzer adapter: bytes, size, MaxSize, seed
-        │
-        ▼
-mutation core: parse → choose eligible node → edit source span → check candidate
-        │
-        ▼
-JavaScript candidate → target harness → libFuzzer coverage and corpus selection
+libFuzzer parent (corpus entry)          second input (crossover)
+        │                                          │
+        ▼                                          ▼
+ parse (Tree-sitter) ──► context + scope analysis at a chosen position
+        │                     │
+        │     ┌───────────────┴──────────────────────────────┐
+        │     ▼                                              ▼
+        │  grammar generator (generator.cc)          seed transforms (mutator.cc)
+        │  uses visible names, seed expressions,     wrap, delete, duplicate, swap,
+        │  seed functions/classes                    literal/operator, transplant
+        ▼     └───────────────┬──────────────────────────────┘
+   empty parent → whole       ▼
+   program generated   candidate → Tree-sitter check + early-error check
+                              ▼
+                  libFuzzer runs it, keeps it if coverage grows
 ```
 
-The adapter only translates the callback arguments and copies the returned bytes. It does not contain JavaScript mutation rules. Other fuzzers or test programs can use the same core API.
+## Vocabulary and grammar
 
-## Core representation
+`generator.h` compiles in the JavaScript keyword and punctuator tables. Identifiers, numbers (decimal, hex, octal, binary, exponents, separators, BigInt, legacy octal in sloppy code), strings (every escape form, line continuations), templates (substitutions, and the invalid escapes that only tagged templates allow), and regular expressions (groups, named groups, backreferences, lookaround, quantifiers, Unicode properties, `v`-mode sets, flags) come from lexical rules.
 
-Use a pinned Tree-sitter runtime and JavaScript grammar to find syntax nodes and byte ranges. Edit only selected spans of the original source, preserving the rest of the seed exactly. This avoids building a JavaScript printer in the first milestone.
+The generator is a recursive grammar over the Script goal. Every rule composes with every other where the language allows it:
 
-Each edit rule declares the node types and parent contexts it accepts, the replacement it can produce, and a maximum output size check. For example, an expression replaces an expression; a statement insertion occurs only at a statement-list boundary. A seeded PRNG chooses among applicable edits within the limits below.
+- **Statements:** all loop forms including `for await` and the Annex B `for (var x = 1 in o)`, labeled statements with `break L`/`continue L`, single-statement and block bodies, dangling `else`, `switch` with case declarations, `try`/`catch` with patterns and optional binding, `with` in sloppy code, directive prologues (`"use strict"`), automatic semicolon insertion, comments including HTML-like comments, and a hashbang.
+- **Functions:** declarations and expressions, async and generator variants, arrows with and without parentheses, and parameters with defaults (including functions, classes and arrows as defaults), destructuring and rest. A function or arrow can be nested inside another's default value.
+- **Classes:** heritage, constructors with `super(...)`, methods, getters and setters, static and instance fields, static blocks, `#private` fields, methods and accessors, `#x in obj`, and computed keys. Object literals support methods, accessors, computed and shorthand keys, spread and `__proto__`.
+- **Expressions:** every operator, printed with only the parentheses that precedence requires. That covers `??` mixing rules, `**` versus unary operators, optional chains (including `?.()` and private members), tagged templates, `new` with and without arguments, `import()`, `new.target`, `super.x`, `await`, `yield`/`yield*`, and destructuring assignment.
 
-The first language profile is ECMAScript 2026 with the Script parse goal and standard syntax only. It guides rule selection and fixes the profile for target-parser measurements. Tree-sitter can accept module syntax and overlook ECMAScript early errors. A clean tree qualifies an edit as valid-leaning. The target parser determines actual acceptance.
+A context record (`GenContext`) gates every construct with legality rules: `return`, `await` and `yield` (including the ban in parameter lists), `break`/`continue` and their labels, `super` property access versus `super()` calls, `new.target`, `arguments` (banned in class fields and static blocks), private names, and strict mode. Class bodies and heritage are always strict. A scope stack provides visible names, and fresh names never collide with any name in the seed.
 
-### Per-call limits
+## Seed transforms
 
-Check the parent length before reading or copying it. A parent over 64 KiB goes directly to fallback. Before building a candidate, check that its byte length fits both `MaxSize` and 64 KiB. Skip edits that would exceed either size.
+The parent is never discarded. For each edit, the mutator picks a position and computes that position's context and its *visible names*: parameters, locals, loop and catch bindings, and class and function names in enclosing scopes. Generated code at that position reuses those names and the seed's own expressions and functions.
 
-Allow up to four edit attempts. Across the initial parse and all attempts combined, allow 1,024 Tree-sitter progress callbacks and 65,536 node visits by the core. Use deterministic counters across reparses and retries; work exhaustion returns the fallback. The in-process first milestone measures peak memory against an 8 MiB target. It does not claim a hard per-call memory cap: Tree-sitter's process-wide allocator and allocation-failure behavior do not provide that guarantee.
+| Edit | What it does |
+|---|---|
+| Generate statement | Insert a grammar-generated statement before, between, or after existing statements |
+| Generate expression | Replace a value with a generated expression in the same context |
+| Wrap statement | Put a seed statement inside `if`/`else`, `try`, a loop, `switch`, a label, a block, an arrow, function or generator called immediately (IIFE), a class static block, `with`, or a strict function, but only where that keeps it legal |
+| Wrap expression | Put a seed expression inside an arrow, a parameter default, a class field, a generator, a template, a conditional, a spread, and so on |
+| Literal / operator | Replace a literal with another of the same kind, or an operator with a compatible one |
+| Delete / duplicate / swap | Restructure statement lists while avoiding redeclarations and dead ends |
+| Reuse subtree | Copy a seed function or class (self-contained, with no foreign private names) to another position |
+| Crossover | Transplant a top-level statement from a second corpus input. Its declarations must not collide, and sloppy-only code never enters strict positions |
+| Repair | For an invalid parent, insert a missing token or delete an error span, so invalid corpus entries stay useful |
+| Generate program | Occasionally (3%), replace the parent with a fresh program |
 
-**Project-owner decision (2026-11-17):** the in-process measured-memory approach was approved for this milestone. It replaces the earlier hard 8 MiB cap and host-survival-on-memory-exhaustion requirement.
+Valid mode requires no new Tree-sitter error nodes and no new early errors. An internal checker covers redeclarations, parameter and catch conflicts, `break`/`continue`/`return` targets, duplicate labels, undeclared or duplicate private names, and duplicate constructors. A parent that is already invalid can only improve. Valid mode never returns the `;` fallback while a regenerated program fits.
 
-## Initial mutation rules
+**Malformed mode** corrupts tokens (delete, duplicate, replace with a random keyword or punctuator, swap, truncate, open an unterminated string, template, regex or comment) or injects errors that V8 reports at parse time. Some are built from the seed itself: redeclaring one of its `let` bindings, or moving a seed statement that uses `await` or `break` across a function boundary. Others are inserted at real positions: `return` outside a function, `super()` outside a derived constructor, octal literals in strict code, duplicate `__proto__`, invalid regex flags, and more.
 
-Start with a few independently testable rules:
+## Coverage loop and limits
 
-1. Replace a literal with a different literal of the same grammatical category.
-2. Replace a binary operator with one valid in that expression context.
-3. Wrap an eligible expression with a syntax-preserving construct, with parentheses when required.
-4. Insert a small statement at a verified statement-list boundary.
+libFuzzer keeps coverage-increasing inputs and hands them back as parents, so complexity accumulates across generations. The callback receives no coverage information, so edit weights are fixed; they could adapt later if a runner reported each candidate's outcome. Each call makes up to 8 attempts within shared work limits (4,096 parser progress callbacks, 262,144 node visits). Generation from empty input targets 2,048 bytes regardless of `MaxSize`, so every program replays byte for byte at its exact size. The same input, seed and configuration always produce the same output.
 
-Rules should use parent nodes and spans from the supplied seed. Later rules can address bindings and scopes, functions and arrows, classes and static blocks, templates, modules, and cross-input composition. Each rule gets examples of accepted contexts and rejected contexts before it is enabled in fuzzing.
+## Out of scope
 
-## Input modes and fallback
-
-- **Valid-leaning mode** reparses each edit and accepts it only if the tree contains no `ERROR` or `MISSING` nodes. Measure acceptance by the target parser separately.
-- **Malformed mode** makes one controlled syntax disruption near a real node or token. It reports an edit only when the candidate has more Tree-sitter `ERROR` or `MISSING` nodes than its parent; equal-count cases fall back conservatively.
-- **Fallback** applies in either mode, for any parent. Recoverable subtrees remain eligible for edits. If no eligible edit fits, all attempts are rejected, or a work limit prevents completion, return the single ASCII byte `;`. When `MaxSize` is zero, return zero bytes immediately. Count fallbacks separately from edits in either mode, even if the bytes equal the parent.
-
-The initial mode mix defaults to 90% valid-leaning and 10% malformed, and can be configured. Both modes obey `MaxSize` and never rely on a hard-coded vulnerability PoC.
-
-## Coverage behavior
-
-Stock libFuzzer keeps inputs that discover new features and selects them as future mutation parents. That is the first coverage loop: the core repeatedly edits structurally interesting descendants. The standard custom-mutator callback has no coverage or outcome argument, so the core cannot honestly update per-rule success rates from that callback alone.
-
-The design leaves room for an adapter that can report candidate outcomes to the core. Once such a runner exists, rule weights can be adjusted from measured novelty per rule. Until then, rule selection may depend on the structure of the current parent but must not claim direct coverage learning.
-
-## Build boundary and layout
-
-Proposed layout after review:
-
-```text
-include/js_mutator/      public mutation API
-src/                     parser wrapper, edit rules, mutation engine
-adapters/libfuzzer/      LLVMFuzzerCustomMutator bridge
-tests/                   core correctness and integration checks
-docs/                    requirements, design, benchmark protocol
-```
-
-Build the core as a static C++ library with a pinned Tree-sitter dependency. Keep the mutation engine and its parser dependency out of target coverage instrumentation where the build system permits, so coverage reflects the code under test. AddressSanitizer checks for the mutator itself can be configured separately.
-
-## Evidence required before expansion
-
-- Identical input, seed, and configuration produce identical bytes; every result fits `MaxSize`.
-- The one-byte parent `;` with `MaxSize = 1` returns `;` as a fallback. With `MaxSize = 0` it returns zero bytes. Verify that an oversized parent bypasses parsing and work exhaustion returns the fallback. Measure peak memory on representative and stress inputs.
-- Each initial rule changes representative seeds, preserves unrelated source regions, and rejects incompatible contexts.
-- Report output rates and target-parser acceptance separately for valid-leaning and malformed edits. For example, if the target rejects `export const x = 1` under the Script goal, count that rejection even when Tree-sitter accepts the edit.
-- The core links unchanged into two different harnesses.
-- Under equal time and seed corpora, compare execution rate and target coverage against libFuzzer's default mutation path.
-- Every saved candidate can be replayed by the target harness as a single file.
-
-## Review decisions
-
-1. Is Tree-sitter plus conservative source-span edits acceptable for the first milestone, given its ECMAScript approximation? A full ECMAScript parser would increase precision and implementation cost.
-2. Is the initial 90/10 valid-leaning versus malformed mix appropriate?
-3. Is libFuzzer's indirect coverage loop sufficient for the first milestone, with direct per-rule learning deferred until a runner can provide feedback?
-
-## References
-
-- [libFuzzer callback contract](https://github.com/llvm/llvm-project/blob/main/compiler-rt/lib/fuzzer/FuzzerInterface.h)
-- [libFuzzer corpus and coverage behavior](https://llvm.org/docs/LibFuzzer.html)
-- [Tree-sitter C API](https://github.com/tree-sitter/tree-sitter/blob/master/lib/include/tree_sitter/api.h)
-- [Tree-sitter JavaScript grammar](https://github.com/tree-sitter/tree-sitter-javascript)
-- [ECMAScript early errors](https://tc39.es/ecma262/2026/multipage/error-handling-and-language-extensions.html)
+Module code (`import`/`export`, top-level `await`, `import.meta`) is not generated, because the lab harness parses Script code only. Decorators and `using` declarations are newer than the V8 12.5 lab build and are also excluded. JSX is not JavaScript.
