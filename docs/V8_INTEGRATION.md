@@ -1,18 +1,18 @@
 # V8 parser integration
 
-This recipe connects `js-mutator` to V8's parser fuzzer. Start with sibling checkouts:
+How to build a libFuzzer parser fuzzer for an existing V8 checkout with js-mutator. These steps were run end to end on 2026-11-19 against V8 12.5 (`68cfd6923d2`) on Linux x64, using the GN arguments shown below.
+
+## 1. Fetch the mutator sources
+
+Place the checkouts side by side:
 
 ```text
 workspace/
-  v8/
+  v8/          existing checkout (depot_tools on PATH)
   js-mutator/
 ```
 
-V8's internal parser API and GN configuration change between revisions. On 2026-11-19 the source set below, including `src/generator.cc`, was compiled with V8's Clang and Chromium style plugin and fuzzed on the lab checkout (V8 12.5, Linux x64). The plugin requires out-of-line special members for non-trivial structs, which `generator.cc` provides.
-
-## Prepare the sources
-
-From `workspace/`, configure the mutator once to fetch its pinned Tree-sitter sources, then make them visible inside V8's GN source root:
+From `workspace/`, configure js-mutator once. This only downloads the pinned Tree-sitter sources into `js-mutator/build/_deps`; GN compiles them, so nothing from this build is linked. Then link js-mutator into V8's source tree:
 
 ```sh
 cmake -S js-mutator -B js-mutator/build
@@ -20,11 +20,23 @@ cd v8
 ln -s ../../../js-mutator test/fuzzer/js_mutator_external
 ```
 
-The symlink target is relative to `v8/test/fuzzer/`. Create it only once. GN compiles these sources with V8's Clang/libc++ toolchain; it does not link the CMake-built mutator archives.
+The symlink target is relative to `v8/test/fuzzer/`.
 
-## Add the GN targets
+## 2. Create the harness
 
-Add the following to V8's root `BUILD.gn`. The parser target uses the existing `test/fuzzer/parser.cc`, which supplies `LLVMFuzzerTestOneInput`; the mutator adapter supplies `LLVMFuzzerCustomMutator`.
+V8's `test/fuzzer/parser.cc` drops any input whose brackets are unbalanced as raw characters, including brackets inside strings, regular expressions and comments. That discards about 60% of valid generated programs. Copy it with only the size check:
+
+```sh
+sed 's/^  if (!IsValidInput(data, size)) {$/  if (size > 2048) {/' \
+  test/fuzzer/parser.cc > test/fuzzer/js_mutator_parser.cc
+grep -n 'size > 2048) {' test/fuzzer/js_mutator_parser.cc
+```
+
+The `grep` must print a line; if it does not, your revision's `parser.cc` differs and you should make the same change by hand.
+
+## 3. Add the GN targets
+
+Append to V8's root `BUILD.gn`:
 
 ```gn
 source_set("js_mutator_for_fuzzing") {
@@ -60,7 +72,7 @@ config("js_mutator_fuzzer_link") {
 
 v8_executable("v8_js_mutator_parser_fuzzer") {
   testonly = true
-  sources = [ "test/fuzzer/parser.cc" ]
+  sources = [ "test/fuzzer/js_mutator_parser.cc" ]
   deps = [
     ":fuzzer_support",
     ":js_mutator_for_fuzzing",
@@ -70,40 +82,53 @@ v8_executable("v8_js_mutator_parser_fuzzer") {
     ":internal_config_base",
     ":js_mutator_fuzzer_link",
   ]
+  libs = [ "stdc++" ]
 }
 ```
 
-The mutator core catches `std::bad_alloc`, so its source set enables C++ exceptions. Link exactly one `LLVMFuzzerCustomMutator`. V8's `v8_simple_parser_fuzzer` uses a one-input replay driver and does not run a libFuzzer loop.
+Why each part is needed:
 
-## Build and fuzz
+- The mutator catches `std::bad_alloc`, so its source set enables C++ exceptions.
+- `libs = [ "stdc++" ]` is required. Clang's libFuzzer runtime uses libstdc++ while V8 builds with libc++, so without it linking fails with undefined `std::__cxx11` symbols.
+- The adapter defines `LLVMFuzzerCustomMutator` and `LLVMFuzzerCustomCrossOver`. Link it into exactly one fuzzer.
 
-Configure GN for the V8 revision and its matching Clang/libFuzzer runtime. For a Linux checkout that supports these arguments, a starting configuration is:
+## 4. Build
 
 ```sh
-gn gen out/js-mutator --args='use_libfuzzer=true is_asan=true is_debug=false dcheck_always_on=true v8_enable_fuzztest=false'
+gn gen out/js-mutator --args='use_libfuzzer=true is_asan=true is_debug=false dcheck_always_on=true is_component_build=true symbol_level=1 v8_enable_fuzztest=false use_sysroot=false'
 ninja -C out/js-mutator v8_js_mutator_parser_fuzzer
+```
+
+These are the verified arguments. `dcheck_always_on=true` keeps V8's internal consistency checks active, so they turn into crashes. `use_sysroot=false` builds against the host system libraries instead of Chromium's Debian sysroot; drop it if your checkout has the sysroot installed.
+
+## 5. Fuzz
+
+```sh
 mkdir -p ../corpus
 printf '%s\n' 'function f(x) { return x + 1; }' > ../corpus/seed.js
-JS_MUTATOR_VALID_PERCENT=100 out/js-mutator/v8_js_mutator_parser_fuzzer ../corpus -max_len=2048
+out/js-mutator/v8_js_mutator_parser_fuzzer ../corpus -max_len=2048
 ```
 
-The corpus directory must be writable: libFuzzer saves inputs that add coverage there. Omit `-runs` for continuous fuzzing, or add `-runs=100` for a bounded check. To replay a saved input, pass its file path instead of the corpus directory. If linking reports a missing `libclang_rt.fuzzer.a`, provide compiler-rt matching the Clang used by V8; copying an unrelated runtime can cause ABI or libc link errors.
+An empty corpus also works; the mutator generates programs from scratch. The corpus directory must be writable, because libFuzzer saves coverage-increasing inputs there. Add `-runs=N` for a bounded run, `-jobs=N -workers=N` for parallel processes, or pass a single file path to replay it. Crashes are written to `crash-*` files in the current directory.
 
-The existing `parser.cc` rejects inputs longer than 2,048 bytes and filters unbalanced brackets and nonprintable bytes. The command above uses only valid-leaning edits to avoid wasting malformed-mode attempts. To fuzz malformed inputs, copy `parser.cc` to a new harness file, replace its filter with this function, and point the executable's `sources` at the copy:
+Settings are environment variables read at startup:
 
-```cpp
-bool IsValidInput(const uint8_t*, size_t size) { return size <= 2048; }
-```
+| Variable | Default | Effect |
+|---|---|---|
+| `JS_MUTATOR_VALID_PERCENT` | 90 | Share of valid-leaning edits; the rest are deliberately malformed |
+| `JS_MUTATOR_MAX_LEN` | 0 (off) | Extra output cap; `-max_len=2048` already matches the harness |
+| `JS_MUTATOR_DEFAULT_PERCENT` | 0 | Share of calls handed to libFuzzer's built-in mutator |
 
-The adapter defaults to 90% valid-leaning edits. Set `JS_MUTATOR_VALID_PERCENT` to an integer from 0 to 100 before launch to change the mix.
+The JavaScript vocabulary is compiled in, so `-dict` is unnecessary.
 
-The adapter also exports `LLVMFuzzerCustomCrossOver`, which libFuzzer uses in place of its byte-level crossover. The JavaScript vocabulary is compiled in, so `-dict` is unnecessary. Use `-max_len=2048` (or `JS_MUTATOR_MAX_LEN=2048`) with a harness that skips longer inputs.
+## Comparing against libFuzzer's built-in mutator
 
-To compare against libFuzzer's built-in mutations with the same binary and equal time, run two copies of the corpus:
+Run the same binary for equal time on two copies of the corpus:
 
 ```sh
-JS_MUTATOR_DEFAULT_PERCENT=0   out/x64.lab-libfuzzer/v8_lab_parser_libfuzzer mut -max_total_time=600 -max_len=2048
-JS_MUTATOR_DEFAULT_PERCENT=100 out/x64.lab-libfuzzer/v8_lab_parser_libfuzzer def -max_total_time=600 -max_len=2048 -cross_over=0
+cp -r ../corpus ../corpus-mut && cp -r ../corpus ../corpus-def
+JS_MUTATOR_DEFAULT_PERCENT=0   out/js-mutator/v8_js_mutator_parser_fuzzer ../corpus-mut -max_total_time=600 -max_len=2048
+JS_MUTATOR_DEFAULT_PERCENT=100 out/js-mutator/v8_js_mutator_parser_fuzzer ../corpus-def -max_total_time=600 -max_len=2048 -cross_over=0
 ```
 
-`-cross_over=0` keeps the baseline free of js-mutator's crossover.
+`-cross_over=0` keeps js-mutator's crossover out of the baseline. Compare the final `cov:` values. Delegating to the built-in mutator works on Linux (ELF) builds only.
