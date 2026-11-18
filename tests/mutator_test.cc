@@ -1,90 +1,110 @@
-#include "js_mutator/mutator.h"
+// Interface contract: limits, determinism, fallback, validity, crossover.
+#include "test_util.h"
 
-#include <array>
-#include <cstdlib>
-#include <iostream>
 #include <string>
+#include <vector>
 
-namespace {
-
-void Require(bool condition, const char* message) {
-  if (!condition) {
-    std::cerr << message << '\n';
-    std::exit(1);
-  }
-}
-
-js_mutator::Result Mutate(const std::string& source, size_t max_size,
-                          uint32_t seed, unsigned valid_percent = 100) {
-  return js_mutator::Mutate(
-      reinterpret_cast<const uint8_t*>(source.data()), source.size(),
-      max_size, seed, {valid_percent});
-}
-
-}  // namespace
+using js_mutator::EditKind;
+using js_mutator::Outcome;
+using test::Require;
 
 int main() {
-  using js_mutator::EditKind;
-  using js_mutator::Outcome;
+  test::Syntax syntax;
+  const std::vector<std::string> parents = {
+      "const price = 5;",
+      "function total(price, qty) { return price * qty; }\ntotal(2, 3);",
+      "class Item { #id = 1; get id() { return this.#id; } static { this.n = 0; } }",
+      "async function* read(xs) { for await (const x of xs) yield x; }",
+      "label: for (let i = 0; i < 3; i++) { if (i) continue label; else break; }",
+      "const {a, b: [c = 1, ...d]} = obj, s = `x${a}y`, r = /a(?<n>b)\\k<n>/gu;",
+      "\"use strict\";\nlet x = 1;\nx ||= y ?? 2;",
+  };
 
-  const auto zero = js_mutator::Mutate(nullptr, 100000, 0, 1);
-  Require(zero.source.empty() && zero.outcome == Outcome::kFallback,
-          "MaxSize=0 must return an empty fallback");
-
-  const auto one = Mutate(";", 1, 1);
-  Require(one.source == ";" && one.outcome == Outcome::kFallback,
-          "one-byte input with MaxSize=1 must return ';'");
-
-  const auto oversized = js_mutator::Mutate(nullptr, 65537, 8, 1);
-  Require(oversized.source == ";" && oversized.outcome == Outcome::kFallback,
-          "oversized parent must be rejected before it is read");
-
-  const std::string parent = "function f() { return 1 + 2; }\n";
-  std::array<bool, 4> seen{};
-  for (uint32_t seed = 1; seed <= 256; ++seed) {
-    const auto first = Mutate(parent, 4096, seed);
-    const auto again = Mutate(parent, 4096, seed);
-    Require(first.source == again.source && first.edit == again.edit &&
-                first.outcome == again.outcome,
-            "same seed and input must produce the same result");
-    Require(first.source.size() <= 4096, "result exceeds MaxSize");
-    if (first.outcome != Outcome::kEditedValidLeaning) continue;
-    Require(first.source != parent, "edited output must differ from parent");
-    Require(first.source.find("function f()") != std::string::npos,
-            "edit must preserve the surrounding seed");
-    const unsigned index = static_cast<unsigned>(first.edit) - 1;
-    Require(index < seen.size(), "unexpected edit kind in valid mode");
-    seen[index] = true;
-  }
-  for (bool found : seen) Require(found, "an initial edit rule was never used");
-
-  bool malformed = false;
-  for (uint32_t seed = 1; seed <= 32; ++seed) {
-    const auto result = Mutate(parent, 4096, seed, 0);
-    if (result.outcome == Outcome::kEditedMalformed) {
-      Require(result.edit == EditKind::kDisruptSyntax,
-              "malformed mode used an unexpected edit");
-      malformed = true;
-      break;
+  // MaxSize = 0 returns nothing; small limits are always honored.
+  Require(test::Generate(0, 1).source.empty(), "MaxSize=0 must return zero bytes");
+  for (size_t limit = 1; limit <= 16; ++limit) {
+    for (uint32_t seed = 1; seed <= 32; ++seed) {
+      Require(test::Generate(limit, seed).source.size() <= limit,
+              "generation exceeded a small MaxSize");
+      for (const auto& parent : parents) {
+        Require(test::Mutate(parent, limit, seed).source.size() <= limit,
+                "mutation exceeded a small MaxSize");
+      }
     }
   }
-  Require(malformed, "malformed mode produced no edit");
+  Require(test::Mutate(";", 1, 1).source == ";", "a one-byte limit returns the fallback");
+  Require(test::Mutate("", 128, 1, 0).outcome == Outcome::kFallback,
+          "malformed mode on an empty parent falls back");
 
-  const auto comment_only = Mutate("const = ; // comment", 4096, 1, 0);
-  Require(comment_only.source == ";" &&
-              comment_only.outcome == Outcome::kFallback &&
-              comment_only.edit == EditKind::kNone,
-          "comment-only append must not count as a syntax disruption");
-
-  for (size_t max_size = 0; max_size <= 8; ++max_size) {
-    Require(Mutate(parent, max_size, 3).source.size() <= max_size,
-            "small MaxSize was exceeded");
+  // Determinism and exact-size replay.
+  for (uint32_t seed = 1; seed <= 64; ++seed) {
+    const auto generated = test::Generate(2048, seed);
+    Require(generated.outcome == Outcome::kGeneratedValidLeaning,
+            "empty input must generate a program");
+    Require(test::Generate(2048, seed).source == generated.source,
+            "generation is not deterministic");
+    Require(test::Generate(generated.source.size(), seed).source == generated.source,
+            "generation must replay at its exact size");
+    for (const auto& parent : parents) {
+      Require(test::Mutate(parent, 4096, seed).source ==
+                  test::Mutate(parent, 4096, seed).source,
+              "mutation is not deterministic");
+    }
   }
 
-  const std::string many_statements(32768, ';');
-  const auto work_limited = Mutate(many_statements, 65536, 7);
-  Require(work_limited.source == ";" &&
-              work_limited.outcome == Outcome::kFallback,
-          "work exhaustion must return the fallback");
+  // Valid-leaning output always passes the syntax check and keeps the parent's
+  // vocabulary; no edit kind returns the old fixed snippets.
+  for (const auto& parent : parents) {
+    std::set<std::string> distinct;
+    for (uint32_t seed = 1; seed <= 300; ++seed) {
+      const auto result = test::Mutate(parent, 4096, seed);
+      Require(result.outcome != Outcome::kFallback, "valid parent fell back: " + parent);
+      Require(syntax.Parses(result.source), "valid-leaning output did not parse:\n" +
+                                                result.source);
+      Require(result.source.find("void class Example {};") == std::string::npos,
+              "a fixed template snippet is still emitted");
+      distinct.insert(result.source);
+    }
+    Require(distinct.size() >= 200, "mutations of one parent are not diverse: " + parent);
+  }
+
+  // An invalid parent is repaired or edited, never replaced by `;`.
+  const std::string broken = "function f(a { return a + ; }\nlet x = [1, 2;";
+  unsigned repaired = 0;
+  for (uint32_t seed = 1; seed <= 200; ++seed) {
+    const auto result = test::Mutate(broken, 4096, seed);
+    Require(result.source != ";", "an invalid parent became a dead-end fallback");
+    if (syntax.Errors(result.source) < syntax.Errors(broken)) ++repaired;
+  }
+  Require(repaired >= 20, "invalid parents are rarely repaired");
+
+  // Malformed mode breaks syntax (or injects an early error).
+  unsigned broken_outputs = 0;
+  for (uint32_t seed = 1; seed <= 300; ++seed) {
+    const auto result = test::Mutate(parents[1], 4096, seed, 0);
+    Require(result.outcome == Outcome::kEditedMalformed, "malformed mode did not edit");
+    if (!syntax.Parses(result.source) || result.edit == EditKind::kInjectEarlyError) {
+      ++broken_outputs;
+    }
+  }
+  Require(broken_outputs == 300, "malformed mode produced valid output");
+
+  // Crossover transplants code from the donor into the parent.
+  const std::string donor = "function helper(z) { return z * 3; }\nhelper(4);";
+  bool transplanted = false;
+  for (uint32_t seed = 1; seed <= 200; ++seed) {
+    const auto& parent = parents[1];
+    const auto result = js_mutator::CrossOver(
+        reinterpret_cast<const uint8_t*>(parent.data()), parent.size(),
+        reinterpret_cast<const uint8_t*>(donor.data()), donor.size(), 4096, seed, {100});
+    Require(syntax.Parses(result.source), "crossover output did not parse");
+    if (result.edit == EditKind::kCrossOver &&
+        result.source.find("helper") != std::string::npos &&
+        result.source.find("total") != std::string::npos) {
+      transplanted = true;
+    }
+  }
+  Require(transplanted, "crossover never combined both inputs");
+  std::cout << "mutator contract: ok\n";
   return 0;
 }

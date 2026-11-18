@@ -1,0 +1,8 @@
+execute_process(COMMAND ${SAMPLE} 1500 OUTPUT_FILE ${OUT} RESULT_VARIABLE sample_result)
+if(NOT sample_result EQUAL 0)
+  message(FATAL_ERROR "sampling failed")
+endif()
+execute_process(COMMAND ${NODE} ${CHECK} ${OUT} RESULT_VARIABLE check_result)
+if(NOT check_result EQUAL 0)
+  message(FATAL_ERROR "V8 parse acceptance below threshold")
+endif()

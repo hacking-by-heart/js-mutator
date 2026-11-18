@@ -32,7 +32,7 @@ target_include_directories(js_mutator_javascript_grammar
 target_compile_features(js_mutator_javascript_grammar PRIVATE c_std_11)
 set_target_properties(js_mutator_javascript_grammar PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-add_library(js_mutator STATIC src/mutator.cc)
+add_library(js_mutator STATIC src/mutator.cc src/generator.cc)
 target_compile_features(js_mutator PUBLIC cxx_std_17)
 target_include_directories(js_mutator PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_link_libraries(js_mutator PRIVATE js_mutator_tree_sitter js_mutator_javascript_grammar)
@@ -46,12 +46,30 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
-  add_executable(js_mutator_test tests/mutator_test.cc)
-  target_link_libraries(js_mutator_test PRIVATE js_mutator)
-  add_test(NAME js_mutator_test COMMAND js_mutator_test)
+  foreach(test_name mutator generation)
+    add_executable(js_mutator_${test_name}_test tests/${test_name}_test.cc)
+    target_link_libraries(js_mutator_${test_name}_test PRIVATE js_mutator js_mutator_tree_sitter
+                                                              js_mutator_javascript_grammar)
+    add_test(NAME js_mutator_${test_name}_test COMMAND js_mutator_${test_name}_test)
+  endforeach()
   if(JS_MUTATOR_BUILD_LIBFUZZER_ADAPTER)
     add_executable(js_mutator_adapter_test tests/adapter_test.cc)
-    target_link_libraries(js_mutator_adapter_test PRIVATE js_mutator_libfuzzer)
+    target_link_libraries(js_mutator_adapter_test PRIVATE js_mutator_libfuzzer
+                                                         js_mutator_tree_sitter
+                                                         js_mutator_javascript_grammar)
     add_test(NAME js_mutator_adapter_test COMMAND js_mutator_adapter_test)
+    set_tests_properties(js_mutator_adapter_test PROPERTIES ENVIRONMENT "JS_MUTATOR_VALID_PERCENT=100")
+  endif()
+  # Optional: check acceptance with V8's own parser when Node.js is installed.
+  find_program(JS_MUTATOR_NODE node)
+  add_executable(js_mutator_sample tools/sample.cc)
+  target_link_libraries(js_mutator_sample PRIVATE js_mutator)
+  if(JS_MUTATOR_NODE)
+    add_test(NAME js_mutator_v8_parse_test
+             COMMAND ${CMAKE_COMMAND} -DSAMPLE=$<TARGET_FILE:js_mutator_sample>
+                     -DNODE=${JS_MUTATOR_NODE}
+                     -DCHECK=${CMAKE_CURRENT_SOURCE_DIR}/tools/v8_parse_check.js
+                     -DOUT=${CMAKE_CURRENT_BINARY_DIR}/v8_samples.txt
+                     -P ${CMAKE_CURRENT_SOURCE_DIR}/tools/v8_parse_test.cmake)
   endif()
 endif()
