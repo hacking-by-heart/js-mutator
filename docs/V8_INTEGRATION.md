@@ -111,24 +111,4 @@ out/js-mutator/v8_js_mutator_parser_fuzzer ../corpus -max_len=2048
 
 An empty corpus also works; the mutator generates programs from scratch. The corpus directory must be writable, because libFuzzer saves coverage-increasing inputs there. Add `-runs=N` for a bounded run, `-jobs=N -workers=N` for parallel processes, or pass a single file path to replay it. Crashes are written to `crash-*` files in the current directory.
 
-Settings are environment variables read at startup:
-
-| Variable | Default | Effect |
-|---|---|---|
-| `JS_MUTATOR_VALID_PERCENT` | 90 | Share of valid-leaning edits; the rest are deliberately malformed |
-| `JS_MUTATOR_MAX_LEN` | 0 (off) | Extra output cap; `-max_len=2048` already matches the harness |
-| `JS_MUTATOR_DEFAULT_PERCENT` | 0 | Share of calls handed to libFuzzer's built-in mutator |
-
-The JavaScript vocabulary is compiled in, so `-dict` is unnecessary.
-
-## Comparing against libFuzzer's built-in mutator
-
-Run the same binary for equal time on two copies of the corpus:
-
-```sh
-cp -r ../corpus ../corpus-mut && cp -r ../corpus ../corpus-def
-JS_MUTATOR_DEFAULT_PERCENT=0   out/js-mutator/v8_js_mutator_parser_fuzzer ../corpus-mut -max_total_time=600 -max_len=2048
-JS_MUTATOR_DEFAULT_PERCENT=100 out/js-mutator/v8_js_mutator_parser_fuzzer ../corpus-def -max_total_time=600 -max_len=2048 -cross_over=0
-```
-
-`-cross_over=0` keeps js-mutator's crossover out of the baseline. Compare the final `cov:` values. Delegating to the built-in mutator works on Linux (ELF) builds only.
+By default about 90% of outputs are valid JavaScript and the rest are deliberately broken, to exercise the parser's error handling. Set `JS_MUTATOR_VALID_PERCENT` (0–100) to change that mix. The JavaScript vocabulary is compiled in, so `-dict` is unnecessary.

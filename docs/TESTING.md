@@ -24,18 +24,11 @@ The remaining rejects are all one shape, such as `f([7], [a] = 1)`. The specific
 
 ## Lab fuzzer (V8 12.5, `v8_lab_parser_libfuzzer`)
 
-The harness was rebuilt with `src/generator.cc` in the GN source set. Equal-time runs started from copies of the 376-file corpus, both at about 9,660 coverage edges:
-
-| Run | Coverage | Executions | Speed |
-|---|---:|---:|---:|
-| js-mutator | 15,238 after ~8 min | ~10,800 | ~170/s |
-| libFuzzer built-in, `-cross_over=0` | 12,494 after ~9 min | ~264,000 | ~485/s |
-
-The js-mutator run stopped on a V8 debug check in scope analysis:
+The harness was rebuilt with `src/generator.cc` in the GN source set. Started from a copy of the 376-file corpus at about 9,660 coverage edges, it reached 15,238 edges in about 8 minutes, then stopped on a V8 debug check in scope analysis:
 
 ```text
 src/ast/scopes.cc:2450 Debug check failed:
 !var->has_forced_context_allocation() || var->is_used().
 ```
 
-The inputs are kept outside the repository. These are single runs; a full comparison with `-ignore_crashes` is still open.
+The crashing inputs are kept outside the repository.

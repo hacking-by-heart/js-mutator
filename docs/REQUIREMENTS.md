@@ -54,7 +54,6 @@
 - The one-byte parent `;` with `MaxSize = 1` returns `;` as a fallback. With `MaxSize = 0` it returns zero bytes. Verify the same size-dependent fallback for an oversized parent and for forced work exhaustion, including during the first parse. Report peak memory measurements separately.
 - A set of representative seed programs produces diverse edits that retain identifiable parts of their parents. Every valid-leaning edit passes the Tree-sitter check. Report target-parser acceptance independently for valid-leaning and malformed edits.
 - The same core can be linked to two different harnesses without modifying the core.
-- An equal-time comparison against libFuzzer’s default byte mutations reports parser acceptance, execution rate, and coverage growth. Success thresholds should be set after measuring that baseline.
 - Saved outputs, including crashes, replay as individual input files.
 
 ## Decisions before implementation

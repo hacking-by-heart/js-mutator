@@ -18,10 +18,4 @@ CTest runs the interface contract, the end-goal generation checks, and the adapt
 
 ## libFuzzer adapter
 
-`adapters/libfuzzer.cc` exports `LLVMFuzzerCustomMutator` and `LLVMFuzzerCustomCrossOver`. Environment variables, read once at startup:
-
-| Variable | Default | Effect |
-|---|---|---|
-| `JS_MUTATOR_VALID_PERCENT` | 90 | Share of calls in valid-leaning mode; the rest are deliberately malformed |
-| `JS_MUTATOR_MAX_LEN` | 0 (off) | Output cap below libFuzzer's `max_len`, e.g. 2048 for a harness that skips longer inputs |
-| `JS_MUTATOR_DEFAULT_PERCENT` | 0 | Share of calls given to libFuzzer's built-in byte mutator (Linux/ELF only). 100 gives an A/B baseline from the same binary; also pass `-cross_over=0` |
+`adapters/libfuzzer.cc` exports `LLVMFuzzerCustomMutator` and `LLVMFuzzerCustomCrossOver`. By default about 90% of outputs are valid JavaScript and the rest are deliberately broken; set `JS_MUTATOR_VALID_PERCENT` (0–100) to change that mix.
