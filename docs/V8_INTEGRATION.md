@@ -101,6 +101,58 @@ ninja -C out/js-mutator v8_js_mutator_parser_fuzzer
 
 These are the verified arguments. `dcheck_always_on=true` keeps V8's internal consistency checks active, so they turn into crashes. `use_sysroot=false` builds against the host system libraries instead of Chromium's Debian sysroot; drop it if your checkout has the sysroot installed.
 
+### If linking fails with `libclang_rt.fuzzer.a: No such file or directory`
+
+V8 ships its own Clang but not the libFuzzer runtime. Build that one library from the LLVM commit your Clang was made from, then copy it where the linker looks. Run these from `workspace/`, one line at a time.
+
+Find your Clang's version and commit:
+
+```sh
+v8/third_party/llvm-build/Release+Asserts/bin/clang++ --version
+```
+
+The first line looks like this:
+
+```text
+clang version 24.0.0git (https://chromium.googlesource.com/a/external/github.com/llvm/llvm-project e063be79adf127cce301fe5948273102a33012b6)
+```
+
+Note two values: the major version (`24`) and the commit hash at the end (`e063be79…`). Substitute your own values where the commands below show `24` and `e063be79adf127cce301fe5948273102a33012b6`.
+
+Download only libFuzzer's source at that commit:
+
+```sh
+git init llvm-fuzzer
+cd llvm-fuzzer
+git remote add origin https://github.com/llvm/llvm-project.git
+git sparse-checkout set --no-cone compiler-rt/lib/fuzzer
+git fetch --depth 1 --filter=blob:none origin e063be79adf127cce301fe5948273102a33012b6
+git checkout FETCH_HEAD
+cd compiler-rt/lib/fuzzer
+```
+
+Compile it with V8's Clang and package it:
+
+```sh
+../../../../v8/third_party/llvm-build/Release+Asserts/bin/clang++ -O2 -fPIC -std=c++17 -fno-omit-frame-pointer -c Fuzzer*.cpp
+ar rcs libclang_rt.fuzzer.a Fuzzer*.o
+```
+
+Copy it into V8's Clang, using your major version in the path:
+
+```sh
+cp libclang_rt.fuzzer.a ../../../../v8/third_party/llvm-build/Release+Asserts/lib/clang/24/lib/x86_64-unknown-linux-gnu/
+```
+
+Go back to `v8/` and build again:
+
+```sh
+cd ../../../../v8
+ninja -C out/js-mutator v8_js_mutator_parser_fuzzer
+```
+
+`gclient sync` can replace V8's Clang with a newer one. If the error returns afterwards, repeat these steps with the new version and commit.
+
 ## 5. Fuzz
 
 ```sh
