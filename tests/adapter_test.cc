@@ -2,7 +2,9 @@
 #include "test_util.h"
 
 #include <array>
+#include <cstdio>
 #include <cstring>
+#include <string>
 
 extern "C" size_t LLVMFuzzerCustomMutator(uint8_t* data, size_t size, size_t max_size,
                                            unsigned int seed);
@@ -25,6 +27,13 @@ int main() {
     Require(size > 0 && size <= data.size(), "adapter output size out of range");
     const std::string mutated(reinterpret_cast<const char*>(data.data()), size);
     Require(syntax.Parses(mutated), "adapter output did not parse");
+#ifdef JS_MUTATOR_YIELD_TEST
+    // tests/yield_test.py hashes these units and looks them up in the log.
+    if (std::FILE* unit = std::fopen(("unit." + std::to_string(seed)).c_str(), "wb")) {
+      std::fwrite(mutated.data(), 1, mutated.size(), unit);
+      std::fclose(unit);
+    }
+#endif
     outputs.insert(mutated);
 
     const size_t crossed = LLVMFuzzerCustomCrossOver(
