@@ -24,5 +24,5 @@ console.log(`V8 accepted ${validOk}/${valid} valid-leaning; rejected ${rejected}
 for (const [message, count] of [...errors].sort((a, b) => b[1] - a[1]).slice(0, 10)) {
   console.log(`  ${count}x ${message}`);
 }
-// Allow a small residue: V8 itself rejects some valid code (e.g. f([7], [a] = 1)).
+// Allow a small residue: Node's older V8 rejects some valid code (e.g. f([7], [a] = 1)).
 process.exit(validOk * 1000 >= valid * 995 && rejected * 100 >= malformed * 95 ? 0 : 1);
