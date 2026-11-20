@@ -60,6 +60,11 @@ if(BUILD_TESTING)
     add_test(NAME js_mutator_adapter_test COMMAND js_mutator_adapter_test)
     set_tests_properties(js_mutator_adapter_test PROPERTIES ENVIRONMENT "JS_MUTATOR_VALID_PERCENT=100")
   endif()
+  find_package(Python3 COMPONENTS Interpreter)
+  if(Python3_FOUND)
+    add_test(NAME js_mutator_cov_summary_test
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/cov_summary_test.py)
+  endif()
   # Optional: check acceptance with V8's own parser when Node.js is installed.
   find_program(JS_MUTATOR_NODE node)
   add_executable(js_mutator_sample tools/sample.cc)
