@@ -195,6 +195,9 @@ class Generator {
   Expr Unary(const GenContext& ctx, unsigned depth);
   Expr Assignment(const GenContext& ctx, unsigned depth);
   Expr Call(const GenContext& ctx, unsigned depth);
+  // `eval(...)`: mostly direct calls, sometimes the indirect forms.
+  Expr EvalCall(const GenContext& ctx, unsigned depth);
+  std::string EvalArgument(const GenContext& ctx, unsigned depth);
   Expr Member(const GenContext& ctx, unsigned depth);
   std::string ArgumentList(const GenContext& ctx, unsigned depth);
 

@@ -585,6 +585,10 @@ Dependencies FindDependencies(TSNode root, std::string_view source,
         NodeText(node, source) == "arguments") {
       d.arguments = true;
     }
+    // Tree-sitter reads `await (x)()` as a call of an identifier `await`.
+    if (std::strcmp(type, "identifier") == 0 && NodeText(node, source) == "await") {
+      d.await_ = true;
+    }
     if (std::strcmp(type, "break_statement") == 0 ||
         std::strcmp(type, "continue_statement") == 0) {
       d.jump = true;
@@ -1193,6 +1197,66 @@ const T* PickFrom(const std::vector<T>& items, Random* random) {
   return &items[random->Below(static_cast<uint32_t>(items.size()))];
 }
 
+// A seed name that may be referenced from any generated position, strict
+// code and class bodies included.
+bool IsPlainName(std::string_view name) {
+  if (name.empty() || IsReservedContextualName(name)) return false;
+  for (char c : name) {
+    if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_' && c != '$') return false;
+  }
+  return !std::isdigit(static_cast<unsigned char>(name[0]));
+}
+
+std::vector<std::string> PlainNames(const std::vector<std::string>& names) {
+  std::vector<std::string> out;
+  for (const std::string& name : names) {
+    if (IsPlainName(name)) out.push_back(name);
+  }
+  return out;
+}
+
+// A direct eval statement, placed where scope analysis has the most cases:
+// sloppy blocks with function declarations, catch blocks, `with`, parameter
+// scopes, derived-class methods, fields and static blocks.
+std::optional<std::string> EditEvalStatement(Mutation& m) {
+  auto points = InsertionPoints(m.root, m.source, m.budget);
+  const InsertionPoint* point = PickFrom(points, m.random);
+  if (!point) return std::nullopt;
+  const GenContext ctx = ContextFor(point->list, m.source);
+  SeedInfo seed;
+  BuildSeedInfo(m.root, m.source, point->list, ctx, m.budget, &seed, false);
+  if (m.budget->exhausted) return std::nullopt;
+  const auto names = PlainNames(seed.names);
+  static constexpr std::string_view kSnippets[] = {
+      "\"\"", "\"0\"", "\"var ev = 1\"", "\"arguments\"", "'{ function ev() {} }'"};
+  std::string arg = names.empty() || m.random->Chance(30)
+                        ? std::string(m.random->Pick(kSnippets))
+                        : "\"" + *PickFrom(names, m.random) + "\"";
+  const std::string e = "eval(" + arg + ")";
+  const std::string f = UniqueName("F", seed, {arg}, m.random->Next());
+  const std::string p = UniqueName("P", seed, {arg}, m.random->Next());
+  std::vector<std::string> forms = {
+      e + ";",
+      "(function () {\n" + e + ";\n})();",
+      "{\nfunction " + f + "() {}\n" + e + ";\n}",
+      "try {} catch (" + p + ") {\n" + e + ";\n}",
+      "((" + p + " = () => " + e + ") => " + p + "())();",
+      "(function (" + p + " = " + e + ") {\nvar " + p + ";\nreturn " + p + ";\n})();",
+      "(class extends Object {\nconstructor() {\nsuper();\n" + e + ";\n}\nm() {\nreturn " +
+          e + ";\n}\n});",
+      "(class {\n" + f + " = " + e + ";\nstatic {\n" + e + ";\n}\n});",
+      "(() => {\n" + e + ";\nreturn () => " + p + ";\n})();",
+  };
+  if (!ctx.strict) {
+    forms.push_back("with ({}) " + e + ";");
+    forms.push_back("(function () {\n{\nfunction " + f + "() {}\n}\nwith ({}) {\n" + e +
+                    ";\n}\n})();");
+  }
+  std::string out = InsertStatement(m.source, *point, *PickFrom(forms, m.random));
+  if (out.size() > m.limit) return std::nullopt;
+  return out;
+}
+
 std::optional<std::string> EditLiteral(Mutation& m) {
   std::vector<TSNode> literals;
   Walk(m.root, m.budget, [&](TSNode node, TSNode parent) {
@@ -1327,6 +1391,9 @@ std::optional<std::string> EditOperator(Mutation& m) {
 }
 
 std::optional<std::string> EditGenerateStatement(Mutation& m) {
+  if (m.random->Chance(8)) {
+    if (auto out = EditEvalStatement(m)) return out;
+  }
   auto points = InsertionPoints(m.root, m.source, m.budget);
   const InsertionPoint* point = PickFrom(points, m.random);
   if (!point) return std::nullopt;
@@ -1379,7 +1446,8 @@ std::optional<std::string> EditWrapExpression(Mutation& m) {
       e, "[" + e + "][0]", "({" + key + ": " + e + "})." + key, "`${" + e + "}`",
       "(0, " + e + ")", "(" + other + " ? " + e + " : " + other + ")",
       "(" + e + " ?? " + other + ")", "(" + other + ", " + e + ")",
-      "(void " + e + ", " + e + ")", "({..." + e + "})", "[...[" + e + "]][0]"};
+      "(void " + e + ", " + e + ")", "({..." + e + "})", "[...[" + e + "]][0]",
+      "(eval(\"\"), " + e + ")"};
   const bool arrow_ok = !deps.await_ && !deps.yield_;
   if (arrow_ok) {
     forms.push_back("(() => " + e + ")()");
@@ -1467,6 +1535,32 @@ std::optional<std::string> EditWrapStatement(Mutation& m, bool unsafe = false) {
        !deps.yield_ && !deps.await_ && no_flow && !deps.arguments && !deps.super_call &&
            (ctx.strict || !HasSloppyOnly(*statement, m.source, m.budget))},
   };
+  // Uncalled wrappers, so the statement is preparsed; the two-level form
+  // nests one lazy function in another. The inner body references an outer
+  // binding, which gives the preparser variable data to save.
+  {
+    const auto names = PlainNames(seed.names);
+    const std::string use = names.empty() ? "" : *PickFrom(names, m.random) + ";\n";
+    const std::string f = UniqueName("F", seed, {s, other, condition}, m.random->Next());
+    const std::string g = UniqueName("G", seed, {s, other, condition, f}, m.random->Next());
+    const std::string lazy = "{\n" + use + s + "\n}";
+    const bool fn_ok = !deps.yield_ && !deps.await_ && !deps.jump && !deps.super_;
+    const bool method_ok = !deps.yield_ && !deps.await_ && !deps.jump && !deps.super_call;
+    const bool strict_ok = ctx.strict || !HasSloppyOnly(*statement, m.source, m.budget);
+    // Only legal forms: these never serve as malformed boundary crossings.
+    const bool arrow_ok = !deps.yield_ && !deps.await_ && !deps.jump;
+    if (fn_ok) {
+      forms.push_back({"var " + f + " = function () " + lazy + ";", true});
+      forms.push_back({"var " + f + " = function () {\nvar " + g + " = function () " +
+                           lazy + ";\n};",
+                       true});
+    }
+    if (arrow_ok) forms.push_back({"var " + f + " = () => " + lazy + ";", true});
+    if (method_ok) forms.push_back({"({ " + f + "() " + lazy + " });", true});
+    if (method_ok && strict_ok) {
+      forms.push_back({"class " + f + " {\nm() " + lazy + "\n}", true});
+    }
+  }
   if (!ctx.strict) forms.push_back({"with (" + condition + ") " + body, true});
   if (!ctx.strict) {
     forms.push_back({"(function () {\n\"use strict\";\n" + s + "\n})();",
@@ -1664,6 +1758,382 @@ std::optional<std::string> EditDisrupt(Mutation& m) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Laziness: which functions V8 preparses and which it compiles eagerly.
+
+// A function V8 is likely to preparse: it is not parenthesized, not behind a
+// `!`/`+` prefix, and not called where it is defined.
+bool IsLikelyLazy(TSNode fn) {
+  TSNode parent = ts_node_parent(fn);
+  if (Is(parent, "parenthesized_expression") || Is(parent, "unary_expression")) {
+    return false;
+  }
+  if (Is(parent, "call_expression") && ts_node_eq(Field(parent, "function"), fn)) {
+    return false;
+  }
+  return true;
+}
+
+bool IsFunctionValue(TSNode node) {
+  return Is(node, "function_expression") || Is(node, "generator_function") ||
+         Is(node, "arrow_function");
+}
+
+// `(function () {...})(args);` becomes `var g = function () {...}; g(args);`,
+// which V8 no longer treats as likely called.
+std::optional<std::string> LazyFromPife(Mutation& m) {
+  struct Pife {
+    TSNode statement;
+    TSNode fn;
+    TSNode args;
+  };
+  std::vector<Pife> pifes;
+  Walk(m.root, m.budget, [&](TSNode node, TSNode parent) {
+    if (!Is(node, "expression_statement") ||
+        (!Is(parent, "program") && !Is(parent, "statement_block")) ||
+        ts_node_has_error(node) || ts_node_named_child_count(node) != 1) {
+      return true;
+    }
+    TSNode e = ts_node_named_child(node, 0);
+    if (Is(e, "unary_expression") && NodeText(Field(e, "operator"), m.source) == "!") {
+      e = Field(e, "argument");
+    }
+    if (Is(e, "parenthesized_expression") && ts_node_named_child_count(e) == 1) {
+      e = ts_node_named_child(e, 0);
+    }
+    if (!Is(e, "call_expression") || !Is(Field(e, "arguments"), "arguments")) return true;
+    TSNode fn = Field(e, "function");
+    if (Is(fn, "parenthesized_expression") && ts_node_named_child_count(fn) == 1) {
+      fn = ts_node_named_child(fn, 0);
+    }
+    if (IsFunctionValue(fn)) pifes.push_back({node, fn, Field(e, "arguments")});
+    return pifes.size() < 256;
+  });
+  const Pife* pife = PickFrom(pifes, m.random);
+  if (!pife) return std::nullopt;
+  std::vector<std::string> reserved;
+  CollectAllNames(m.root, m.source, &reserved, m.budget);
+  SeedInfo seed;
+  seed.reserved = std::move(reserved);
+  const std::string_view fn = NodeText(pife->fn, m.source);
+  const std::string_view args = NodeText(pife->args, m.source);
+  const std::string name = UniqueName("g", seed, {fn, args}, m.random->Next());
+  const std::string text = "var " + name + " = " + std::string(fn) + ";\n" + name +
+                           std::string(args) + ";";
+  return Replace(m.source, ts_node_start_byte(pife->statement),
+                 ts_node_end_byte(pife->statement), text, m.limit);
+}
+
+// Nests a seed statement two or three levels deep in functions that are
+// never called (lazy inside lazy), sometimes with an eager level between.
+std::optional<std::string> LazyNest(Mutation& m) {
+  auto sites = StatementSites(m.root, m.budget);
+  const StatementSite* site = PickFrom(sites, m.random);
+  if (!site) return std::nullopt;
+  const TSNode* statement = PickFrom(site->statements, m.random);
+  const GenContext ctx = ContextFor(site->list, m.source);
+  const Dependencies deps = FindDependencies(*statement, m.source, m.budget);
+  // Nothing may cross a function boundary, except super properties into a
+  // method; arguments in a class field could stay outside any function.
+  if (deps.yield_ || deps.await_ || deps.jump || deps.super_call) return std::nullopt;
+  if (ctx.class_field && deps.arguments) return std::nullopt;
+  SeedInfo seed;
+  BuildSeedInfo(m.root, m.source, site->list, ctx, m.budget, &seed, false);
+  const bool strict_ok = ctx.strict || !HasSloppyOnly(*statement, m.source, m.budget);
+  if (m.budget->exhausted) return std::nullopt;
+  const std::string s(NodeText(*statement, m.source));
+  const auto names = PlainNames(seed.names);
+  std::string body = (names.empty() ? "" : *PickFrom(names, m.random) + ";\n") + s;
+  const unsigned levels = 2 + m.random->Below(2);
+  for (unsigned level = 0; level < levels; ++level) {
+    const std::string f = UniqueName("F", seed, {body}, m.random->Next());
+    const std::string block = "{\n" + body + "\n}";
+    // The innermost level must be a method if the statement uses super.
+    const bool method_only = level == 0 && deps.super_;
+    unsigned kind = m.random->Below(100);
+    if (method_only) kind = strict_ok && m.random->Chance(50) ? 85 : 70;
+    if (kind >= 80 && !strict_ok) kind = 70;
+    if (kind < 25) {
+      body = "var " + f + " = function () " + block + ";";
+    } else if (kind < 40) {
+      body = "var " + f + " = () => " + block + ";";
+    } else if (kind < 58) {
+      body = "function " + f + "() " + block;
+    } else if (kind < 68) {
+      // An eager level between lazy ones.
+      body = m.random->Chance(50) ? "(function () " + block + ")();"
+                                  : "(() => " + block + ")();";
+    } else if (kind < 80) {
+      body = "({ " + f + "() " + block + " });";
+    } else {
+      body = "class " + f + " {\nm() " + block + "\n}";
+    }
+  }
+  return Replace(m.source, ts_node_start_byte(*statement), ts_node_end_byte(*statement),
+                 body, m.limit);
+}
+
+// Adds or removes the parentheses that make V8 compile a function eagerly.
+std::optional<std::string> ToggleEagerParens(Mutation& m) {
+  std::vector<TSNode> lazy;
+  std::vector<TSNode> eager;
+  Walk(m.root, m.budget, [&](TSNode node, TSNode parent) {
+    if (ts_node_has_error(node)) return true;
+    if ((Is(node, "function_expression") || Is(node, "generator_function")) &&
+        !Is(parent, "parenthesized_expression")) {
+      lazy.push_back(node);
+    }
+    if (Is(node, "parenthesized_expression") && ts_node_named_child_count(node) == 1 &&
+        (Is(ts_node_named_child(node, 0), "function_expression") ||
+         Is(ts_node_named_child(node, 0), "generator_function"))) {
+      // Without parentheses, a function at the start of a statement would be
+      // a declaration.
+      bool statement_start = false;
+      for (TSNode p = ts_node_parent(node); !ts_node_is_null(p); p = ts_node_parent(p)) {
+        if (ts_node_start_byte(p) != ts_node_start_byte(node)) break;
+        if (Is(p, "expression_statement") || Is(p, "export_statement")) {
+          statement_start = true;
+          break;
+        }
+      }
+      if (!statement_start) eager.push_back(node);
+    }
+    return lazy.size() + eager.size() < 512;
+  });
+  const bool add = eager.empty() || (!lazy.empty() && m.random->Chance(60));
+  if (add) {
+    const TSNode* node = PickFrom(lazy, m.random);
+    if (!node) return std::nullopt;
+    return Replace(m.source, ts_node_start_byte(*node), ts_node_end_byte(*node),
+                   "(" + std::string(NodeText(*node, m.source)) + ")", m.limit);
+  }
+  const TSNode* node = PickFrom(eager, m.random);
+  const size_t start = ts_node_start_byte(*node);
+  std::string text(NodeText(ts_node_named_child(*node, 0), m.source));
+  // `typeof(function () {})` must not become `typeoffunction () {}`.
+  if (start > 0 && (std::isalnum(static_cast<unsigned char>(m.source[start - 1])) ||
+                    m.source[start - 1] == '_' || m.source[start - 1] == '$')) {
+    text = " " + text;
+  }
+  return Replace(m.source, start, ts_node_end_byte(*node), text, m.limit);
+}
+
+std::optional<std::string> EditLaziness(Mutation& m) {
+  const unsigned pick = m.random->Below(100);
+  if (pick < 30) {
+    if (auto out = LazyFromPife(m)) return out;
+  }
+  if (pick < 75) {
+    if (auto out = LazyNest(m)) return out;
+  }
+  return ToggleEagerParens(m);
+}
+
+// ---------------------------------------------------------------------------
+// Capture: references that cross closure boundaries, for variable allocation
+// and hole-check elimination.
+
+// The binding names an identifier in value position may refer to.
+std::vector<TSNode> CaptureCandidates(Mutation& m) {
+  std::vector<TSNode> out;
+  for (TSNode node : ExpressionCandidates(m.root, m.budget)) {
+    if (Is(node, "identifier") && IsPlainName(NodeText(node, m.source))) out.push_back(node);
+  }
+  return out;
+}
+
+// A use of a let/const/class binding before its declaration, from a closure
+// or by moving the declaration below its first use in the same list.
+std::optional<std::string> CaptureTdz(Mutation& m, const SeedInfo& seed) {
+  struct Decl {
+    const StatementSite* site;
+    size_t index;
+    std::string name;
+  };
+  auto sites = StatementSites(m.root, m.budget);
+  std::vector<Decl> decls;
+  for (const auto& site : sites) {
+    for (size_t i = 0; i < site.statements.size(); ++i) {
+      TSNode s = site.statements[i];
+      if (!Is(s, "lexical_declaration") && !Is(s, "class_declaration")) continue;
+      std::vector<std::string> names;
+      DeclaredNames(s, m.source, &names, m.budget);
+      names = PlainNames(names);
+      if (!names.empty()) decls.push_back({&site, i, *PickFrom(names, m.random)});
+    }
+  }
+  const Decl* decl = PickFrom(decls, m.random);
+  if (!decl) return std::nullopt;
+  TSNode d = decl->site->statements[decl->index];
+  const std::string& n = decl->name;
+  if (m.random->Chance(50)) {
+    // Move the declaration just below the first later statement using it.
+    for (size_t j = decl->index + 1; j < decl->site->statements.size(); ++j) {
+      TSNode use = decl->site->statements[j];
+      if (IsDeclarationType(ts_node_type(use)) && !Is(use, "lexical_declaration")) continue;
+      const bool uses = ContainsNode(use, m.budget, [&](TSNode x) {
+        return Is(x, "identifier") && NodeText(x, m.source) == n;
+      });
+      if (!uses) continue;
+      std::string text(NodeText(d, m.source));
+      if (text.back() != ';' && text.back() != '}') text += ';';
+      std::string out(m.source.substr(0, ts_node_start_byte(d)));
+      out.append(m.source.substr(ts_node_end_byte(d),
+                                 ts_node_end_byte(use) - ts_node_end_byte(d)));
+      out += "\n" + text;
+      out.append(m.source.substr(ts_node_end_byte(use)));
+      if (out.size() > m.limit) return std::nullopt;
+      return out;
+    }
+  }
+  const std::string f = UniqueName("F", seed, {}, m.random->Next());
+  static constexpr const char* kForms[] = {"function %F() { return %N; }",
+                                           "var %F = () => %N;",
+                                           "var %F = function () { return () => %N; };"};
+  std::string text = m.random->Pick(kForms);
+  for (size_t at; (at = text.find("%F")) != std::string::npos;) text.replace(at, 2, f);
+  for (size_t at; (at = text.find("%N")) != std::string::npos;) text.replace(at, 2, n);
+  return Replace(m.source, ts_node_start_byte(d), ts_node_start_byte(d), text + "\n",
+                 m.limit);
+}
+
+std::optional<std::string> EditCapture(Mutation& m) {
+  SeedInfo seed;
+  CollectAllNames(m.root, m.source, &seed.reserved, m.budget);
+  const unsigned pick = m.random->Below(100);
+  if (pick < 15) {
+    if (auto out = CaptureTdz(m, seed)) return out;
+  }
+  auto candidates = CaptureCandidates(m);
+  const TSNode* node = PickFrom(candidates, m.random);
+  if (!node || m.budget->exhausted) return std::nullopt;
+  const GenContext ctx = ContextFor(*node, m.source);
+  const std::string n(NodeText(*node, m.source));
+  if (pick < 25) {
+    // Capture and forget: a closure statement next to the use.
+    TSNode statement = *node;
+    while (!ts_node_is_null(statement)) {
+      TSNode parent = ts_node_parent(statement);
+      if (Is(parent, "program") || Is(parent, "statement_block")) break;
+      statement = parent;
+    }
+    if (!ts_node_is_null(statement) && !IsDirective(statement)) {
+      const size_t at = ts_node_start_byte(statement);
+      return Replace(m.source, at, at, "{ () => " + n + "; }\n", m.limit);
+    }
+  }
+  const std::string p = UniqueName("P", seed, {}, m.random->Next());
+  const std::string q = UniqueName("Q", seed, {p}, m.random->Next());
+  const std::string f = UniqueName("F", seed, {p, q}, m.random->Next());
+  std::vector<std::string> forms = {
+      "(() => " + n + ")()",
+      "(function () { return " + n + "; })()",
+      "((" + p + " = () => " + n + ") => " + p + "())()",
+      "(class { static { " + n + "; } }, " + n + ")",
+      "(() => " + n + ", " + n + ")",
+      // Shadowing: the closure sees an inner binding declared after it.
+      "(() => { const " + f + " = () => " + n + "; const " + n + " = 0; return " + f +
+          "(); })()",
+      "((" + n + ") => () => " + n + ")(" + n + ")()",
+      "(() => { eval(\"\"); return " + n + "; })()",
+  };
+  if (!ctx.strict) {
+    forms.push_back("(function () { eval(\"\"); return () => " + n + "; })()()");
+    forms.push_back("(function () { with ({}) return () => " + n + "; })()()");
+  }
+  if (!ctx.class_field) {
+    // Mapped arguments object alongside a captured parameter.
+    forms.push_back("(function (" + p + ", " + q + ") { arguments; return () => " + p +
+                    "; })(" + n + ")()");
+  }
+  return Replace(m.source, ts_node_start_byte(*node), ts_node_end_byte(*node),
+                 "(" + *PickFrom(forms, m.random) + ")", m.limit);
+}
+
+// ---------------------------------------------------------------------------
+// Malformed mode: early errors that only the full parser reports, placed in
+// bodies V8 preparses.
+
+std::optional<std::string> LazyBodyEarlyError(Mutation& m) {
+  struct Body {
+    TSNode body;
+    TSNode fn;
+  };
+  std::vector<Body> bodies;
+  Walk(m.root, m.budget, [&](TSNode node, TSNode) {
+    if (!IsFunctionType(ts_node_type(node)) || ts_node_has_error(node)) return true;
+    TSNode body = Field(node, "body");
+    if (Is(body, "statement_block") && IsLikelyLazy(node)) bodies.push_back({body, node});
+    return bodies.size() < 256;
+  });
+  const Body* pick = PickFrom(bodies, m.random);
+  if (!pick) return std::nullopt;
+  SeedInfo seed;
+  CollectAllNames(m.root, m.source, &seed.reserved, m.budget);
+  std::vector<std::string> params;
+  CollectBindingNames(Field(pick->fn, "parameters"), m.source, &params, m.budget);
+  CollectBindingNames(Field(pick->fn, "parameter"), m.source, &params, m.budget);
+  params = PlainNames(params);
+  std::string text;
+  if (!params.empty() && m.random->Chance(50)) {
+    // A lexical declaration of a parameter name.
+    const std::string& p = *PickFrom(params, m.random);
+    static constexpr const char* kForms[] = {"let %;", "const % = 1;", "class % {}"};
+    text = m.random->Pick(kForms);
+    text.replace(text.find('%'), 1, p);
+  } else {
+    const std::string n = UniqueName("z", seed, {}, m.random->Next());
+    text = m.random->Chance(50) ? "let " + n + ";\nvar " + n + ";"
+                                : "var " + n + ";\nlet " + n + ";";
+  }
+  const auto statements = ListStatements(pick->body);
+  const size_t prologue = PrologueLength(statements);
+  const size_t at = prologue < statements.size() ? ts_node_start_byte(statements[prologue])
+                                                 : ts_node_end_byte(pick->body) - 1;
+  return Replace(m.source, at, at, "\n" + text + "\n", m.limit);
+}
+
+// Parameter/body and catch conflicts, duplicate and strict parameters, in an
+// eager (called) or lazy (uncalled) function.
+std::string LazyEarlyErrorSnippet(Random* random, const SeedInfo& seed) {
+  struct Snippet {
+    const char* params;
+    const char* body;
+    bool arrow_ok;
+  };
+  static constexpr Snippet kSnippets[] = {
+      {"a = 1", "let a;", true},
+      {"{a}", "const a = 1;", true},
+      {"a, ...b", "let b;", true},
+      {"[a]", "class a {}", true},
+      {"", "try {} catch (e) { let e; }", true},
+      {"", "try {} catch ([e]) { var e; }", true},
+      {"", "let z; var z;", true},
+      {"", "{ let z; { var z; } }", true},
+      {"p = () => 1, q = class { static {} }", "let z; var z;", true},
+      {"a, a", "\"use strict\";", false},
+      {"a = 1, a", "", false},
+      {"a, {b}, a", "", false},
+      {"a = 1", "\"use strict\";", false},
+  };
+  const Snippet& s = random->Pick(kSnippets);
+  const std::string f = UniqueName("F", seed, {}, random->Next());
+  const std::string body = std::string("{ ") + s.body + " }";
+  const std::string params = std::string("(") + s.params + ")";
+  switch (random->Below(s.arrow_ok ? 5 : 4)) {
+    case 0:  // eager
+      return "(function " + params + " " + body + ")();";
+    case 1:
+      return "function " + f + params + " " + body;
+    case 2:
+      return "var " + f + " = function " + params + " " + body + ";";
+    case 3:
+      return "({ " + f + params + " " + body + " });";
+    default:
+      return "var " + f + " = " + params + " => " + body + ";";
+  }
+}
+
 // Parse-time errors built from the seed's own code and context.
 std::optional<std::string> EditEarlyError(Mutation& m) {
   const unsigned pick = m.random->Below(100);
@@ -1691,9 +2161,20 @@ std::optional<std::string> EditEarlyError(Mutation& m) {
       }
     }
   }
+  if (pick >= 45 && pick < 60) {
+    // Full-parser-only errors inside a body V8 preparses.
+    if (auto out = LazyBodyEarlyError(m)) return out;
+  }
   auto points = InsertionPoints(m.root, m.source, m.budget);
   const InsertionPoint* point = PickFrom(points, m.random);
   if (!point) return std::nullopt;
+  if (pick >= 60 && pick < 72) {
+    SeedInfo seed;
+    CollectAllNames(m.root, m.source, &seed.reserved, m.budget);
+    std::string out = InsertStatement(m.source, *point, LazyEarlyErrorSnippet(m.random, seed));
+    if (out.size() > m.limit) return std::nullopt;
+    return out;
+  }
   const GenContext ctx = ContextFor(point->list, m.source);
   std::vector<std::string> options;
   if (!ctx.loop && !ctx.switch_stmt) options.push_back("break;");
@@ -1776,6 +2257,10 @@ std::optional<std::string> Apply(Mutation& m, EditKind kind) {
       return EditDisrupt(m);
     case EditKind::kInjectEarlyError:
       return EditEarlyError(m);
+    case EditKind::kLaziness:
+      return EditLaziness(m);
+    case EditKind::kCapture:
+      return EditCapture(m);
     default:
       return std::nullopt;
   }
@@ -1872,7 +2357,8 @@ Result MutateImpl(const uint8_t* data, size_t size, const uint8_t* donor,
              {EditKind::kWrapStatement, 12},     {EditKind::kWrapExpression, 10},
              {EditKind::kLiteral, 8},            {EditKind::kBinaryOperator, 8},
              {EditKind::kReuseSubtree, 6},       {EditKind::kDuplicateStatement, 5},
-             {EditKind::kSwapStatements, 5},     {EditKind::kDeleteStatement, 4}};
+             {EditKind::kSwapStatements, 5},     {EditKind::kDeleteStatement, 4},
+             {EditKind::kLaziness, 7},           {EditKind::kCapture, 7}};
     if (*parent_errors != 0) rules.push_back({EditKind::kRepairSyntax, 60});
     if (donor_tree) rules.push_back({EditKind::kCrossOver, 70});
   } else {
