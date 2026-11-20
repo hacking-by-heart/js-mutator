@@ -327,6 +327,10 @@ bool HasEarlyErrorForTesting(std::string_view source);
 
 // The tag that marks a source as Module code.
 inline constexpr std::string_view kModuleTag = "/*M*/";
+// Tags for the REPL and eval goals of the V8 harness. Tagged sources stay
+// plain scripts here: valid ones are valid scripts without `await` names.
+inline constexpr std::string_view kReplTag = "/*R*/";
+inline constexpr std::string_view kEvalTag = "/*E*/";
 
 // True when an expression statement starting with `text` would be parsed as
 // something else (a block, declaration, or `let [` declaration).

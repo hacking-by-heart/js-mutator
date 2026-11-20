@@ -1,6 +1,7 @@
 // Interface contract: limits, determinism, fallback, validity, crossover.
 #include "test_util.h"
 
+#include <chrono>
 #include <cstring>
 #include <algorithm>
 #include <map>
@@ -172,7 +173,7 @@ void TestMagicComments(test::Syntax& syntax) {
       const char sign = at + 2 < result.source.size() ? result.source[at + 2] : 0;
       if (sign == '#' || sign == '@') ++lines;
     }
-    Require(lines >= 1 && lines <= 4, "magic comments accumulate");
+    Require(lines >= 1 && lines <= 5, "magic comments accumulate");
     for (const char* name : {"sourceURL=", "sourceMappingURL=", "debugId=",
                              "allFunctionsCalledOnLoad", "functionsCalledOnLoad="}) {
       if (result.source.find(name) != std::string::npos) names.insert(name);
@@ -370,7 +371,20 @@ int main() {
       "(f()) ?\?= 1;", "(f()) &&= 1;", "(f``) = 1;", "({a}) = 1;", "([a]) = 1;",
       "(new f()) = 1;", "(a?.b) = 1;", "(import(\"x\")) = 1;", "\"use strict\"; (eval) = 1;",
       "\"use strict\"; eval++;", "\"use strict\"; for ((f()) of o);",
-      "{ using r = null; { var r; } }", "{ for (var r in o); using r = null; }"};
+      "{ using r = null; { var r; } }", "{ for (var r in o); using r = null; }",
+      // Tree-sitter reads these blocks as object literals.
+      "\"use strict\"; { L: function f() {} }", "/*M*/{ L: function f() {} }",
+      "{ L: function* g() {} }", "{ L: async function g() {} }", "{ a: 1, b: 2 }",
+      "() => { a: 1, b: 2 }", "{ \"a\": 1 }", "L: { L: 1 }",
+      "/*M*/\nexport * as default from \"x\";\nexport default 1;", "/*M*/\n() => await 0;",
+      // Strict-only errors in strict script code.
+      "\"use strict\"; 010;", "function f() { \"use strict\"; 010; }",
+      "class C { m() { return 010; } }", "class C { m() { with (a) {} } }",
+      "\"use strict\"; with (a) {}",
+      "function g() { class C { static { await (x)(); } } }",
+      "class A { static { arguments } }", "class A { static { () => arguments } }",
+      "class A { static { class B { [arguments] = 1 } } }", "class A { x = arguments }",
+      "class A { x = class B { [arguments] = 1 } }"};
   for (const char* source : kEarlyErrors) {
     Require(js_mutator::internal::SourceHasEarlyError(source),
             std::string("checker missed an early error: ") + source);
@@ -395,7 +409,14 @@ int main() {
       "var x, o = {}; (x) = 1; ((o.p)) = 2; (x) += 1; (o.p) ?\?= 3; (x)++; ++(o.p);",
       "(f()) = 1;", "(f()) += 1;", "f()++;", "++f();", "for ((f()) of o);",
       "for ((x) in o);", "({ [(f())++]() { \"use strict\"; } });",
-      "(function () { \"use strict\"; for (let [a] of b); });"};
+      "(function () { \"use strict\"; for (let [a] of b); });",
+      "{ L: function f() {} }", "if (1) { L: function g() {} }", "{ a, b }", "{ a: 1, b }",
+      "x => { L: 1 }", "/*M*/\nawait 0;", "/*M*/\nexport const k = await 1;",
+      "/*M*/\n{ await 0; }", "\"use strict\"; var await = 1;",
+      "class C { m() { return String.raw`\\01`; } }", "\"use strict\"; String.raw`\\1${0}`;",
+      "async function g() { await (x)(); }", "async function g() { await (x)`t`; }",
+      "class C { [arguments] = 1 }", "class A { static { class B { m() { arguments } } } }",
+      "class A { x = function () { return arguments; } }"};
   for (const char* source : kValid) {
     Require(!js_mutator::internal::SourceHasEarlyError(source),
             std::string("checker rejected valid code: ") + source);
@@ -571,15 +592,145 @@ int main() {
   // never becomes a valid-leaning module.
   unsigned to_module = 0;
   unsigned to_script = 0;
+  unsigned to_repl = 0;
+  unsigned to_eval = 0;
   for (uint32_t seed = 1; seed <= 600; ++seed) {
     const auto up = test::Mutate(parents[1], 4096, seed);
     if (up.edit == EditKind::kFlipGoal && up.source.rfind("/*M*/", 0) == 0) ++to_module;
     const auto down = test::Mutate("/*M*/\nlet x = 1;\n{ using r = null; }", 4096, seed);
     if (down.edit == EditKind::kFlipGoal && down.source.rfind("/*M*/", 0) != 0) ++to_script;
     const auto sloppy = test::Mutate("with (a) { b; }\nvar c = 010;", 4096, seed);
-    Require(sloppy.edit != EditKind::kFlipGoal, "sloppy code was flipped to a module");
+    Require(sloppy.edit != EditKind::kFlipGoal || sloppy.source.rfind("/*M*/", 0) != 0,
+            "sloppy code was flipped to a module");
+    if (sloppy.edit == EditKind::kFlipGoal) {
+      if (sloppy.source.rfind("/*R*/", 0) == 0) ++to_repl;
+      if (sloppy.source.rfind("/*E*/", 0) == 0) ++to_eval;
+    }
+    const auto named = test::Mutate("var await = 1;\nawait + 1;", 4096, seed);
+    Require(named.edit != EditKind::kFlipGoal || named.source.rfind("/*R*/", 0) != 0,
+            "an `await` name was flipped to REPL code");
   }
   Require(to_module > 0 && to_script > 0, "the goal flip never happens");
+  Require(to_repl > 0 && to_eval > 0, "REPL and eval goals are never chosen");
+
+  // A labelled function in a block stays out of modules.
+  for (uint32_t seed = 1; seed <= 300; ++seed) {
+    for (const char* parent : {"{ L: function f() {} }\n", "if (1) { L: function g() {} }\n"}) {
+      const auto result = test::Mutate(parent, 4096, seed);
+      Require(result.outcome != Outcome::kEditedValidLeaning ||
+                  result.source.rfind("/*M*/", 0) != 0 ||
+                  result.source.find("L: function") == std::string::npos,
+              "a labelled function declaration became module code:\n" + result.source);
+    }
+  }
+
+  // `export * as default` is a default export.
+  for (uint32_t seed = 1; seed <= 300; ++seed) {
+    const auto result =
+        test::Mutate("/*M*/\nexport * as default from \"x\";\nlet a = 1;\n", 4096, seed);
+    Require(result.outcome != Outcome::kEditedValidLeaning ||
+                result.source.find("\nexport default") == std::string::npos,
+            "a second default export:\n" + result.source);
+  }
+
+  // Top-level await keeps a module clean, so its edits stay checked.
+  unsigned tla_clean = 0;
+  for (uint32_t seed = 1; seed <= 200; ++seed) {
+    const auto result = test::Mutate("/*M*/\nawait 0;\nlet q = 1;\nfunction f() { return q; }\n",
+                                     4096, seed);
+    if (result.outcome == Outcome::kEditedValidLeaning) ++tla_clean;
+  }
+  Require(tla_clean >= 150, "top-level await made the module look invalid");
+
+  // On a parent that already fails the check, no edit relies on it.
+  for (uint32_t seed = 1; seed <= 300; ++seed) {
+    const auto result = test::Mutate(
+        "let a; let a;\nclass C { #x; static #y; m() { return this.#x + C.#y; } }\n", 4096, seed);
+    Require(result.edit != EditKind::kRebind && result.edit != EditKind::kPrivateRename &&
+                result.edit != EditKind::kFlipGoal,
+            "a checker-filtered edit ran on an invalid parent");
+  }
+
+  // Compile hints name real functions: each decoded position, counted from
+  // the comment's line terminator, is the `(` of a function or arrow.
+  {
+    const std::string hinted = "let k = 1;\nfunction a(x) { return function b(y) { return y; }; }\n"
+                               "const c = (z) => z;\nclass D { m(w) {} }\n";
+    unsigned matched = 0;
+    unsigned decoded = 0;
+    for (uint32_t seed = 1; seed <= 3000 && matched < 20; ++seed) {
+      const auto result = test::Mutate(hinted, 4096, seed);
+      if (result.edit != EditKind::kMagicComment) continue;
+      const std::string key = "//# functionsCalledOnLoad=";
+      const size_t at = result.source.rfind(key);
+      if (at == std::string::npos) continue;
+      const size_t end = result.source.find('\n', at);
+      if (end == std::string::npos) continue;
+      const std::string value = result.source.substr(at + key.size(), end - at - key.size());
+      if (value.empty() || value.find_first_of(" \t!=") != std::string::npos) continue;
+      // Base64 VLQ deltas.
+      static const std::string kBase64 =
+          "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+      std::vector<long> positions;
+      long last = static_cast<long>(end);
+      bool real = true;
+      uint32_t v = 0;
+      unsigned shift = 0;
+      for (char ch : value) {
+        const size_t digit = kBase64.find(ch);
+        if (digit == std::string::npos) real = false;
+        v |= static_cast<uint32_t>(digit & 31) << shift;
+        shift += 5;
+        if (digit & 32) continue;
+        const long delta = (v & 1) ? -static_cast<long>(v >> 1) : static_cast<long>(v >> 1);
+        if (delta < 0) real = false;
+        last += delta;
+        positions.push_back(last);
+        v = 0;
+        shift = 0;
+      }
+      if (!real || positions.empty()) continue;
+      // Random hint values are part of the mix too; count the real ones.
+      ++decoded;
+      bool all_near = true;
+      for (long position : positions) {
+        bool near = false;
+        for (long i = std::max(0L, position - 3);
+             i <= position + 3 && i < static_cast<long>(result.source.size()); ++i) {
+          if (result.source[i] == '(') near = true;
+        }
+        all_near = all_near && near;
+      }
+      if (all_near) ++matched;
+    }
+    Require(matched >= 8 && matched * 2 >= decoded, "compile hints rarely name functions: " + std::to_string(matched) + " of " +
+                std::to_string(decoded));
+  }
+
+  // Deeply nested input stays within the stack and the time limits.
+  {
+    const auto start = std::chrono::steady_clock::now();
+    const std::string deep[] = {std::string(3000, '[') + std::string(3000, ']'),
+                                std::string(1000, '{') + std::string(1000, '}'),
+                                [] {
+                                  std::string s;
+                                  for (int i = 0; i < 5000; ++i) s += "a=";
+                                  return s + "1";
+                                }()};
+    for (const std::string& input : deep) {
+      for (uint32_t seed = 0; seed < 3; ++seed) {
+        const auto result = test::Mutate(input, 65536, seed, 90);
+        Require(result.source.size() <= 65536, "deep input exceeded max_size");
+        const auto crossed = js_mutator::CrossOver(
+            reinterpret_cast<const uint8_t*>(input.data()), input.size(),
+            reinterpret_cast<const uint8_t*>(input.data()), input.size(), 4096, seed, {90});
+        Require(crossed.source.size() <= 4096, "deep crossover exceeded max_size");
+      }
+    }
+    const double seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    Require(seconds < 20, "deeply nested input is slow: " + std::to_string(seconds) + " s");
+  }
   std::cout << "mutator contract: ok\n";
   return 0;
 }

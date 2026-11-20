@@ -301,6 +301,18 @@ bool IsModuleSource(std::string_view source) {
   return source.substr(0, internal::kModuleTag.size()) == internal::kModuleTag;
 }
 
+bool IsReplSource(std::string_view source) {
+  return source.substr(0, internal::kReplTag.size()) == internal::kReplTag;
+}
+
+// The leading goal tag, if any.
+const char* GoalTag(std::string_view source) {
+  for (std::string_view tag : {internal::kModuleTag, internal::kReplTag, internal::kEvalTag}) {
+    if (source.substr(0, tag.size()) == tag) return tag.data();
+  }
+  return nullptr;
+}
+
 bool HasLineBreak(std::string_view source, size_t start, size_t end) {
   if (start >= end || end > source.size()) return false;
   return source.substr(start, end - start).find_first_of("\n\r") != std::string_view::npos;
@@ -326,6 +338,25 @@ bool IsRealUsing(TSNode node, std::string_view source) {
   return !HasLineBreak(source, ts_node_end_byte(keyword), ts_node_start_byte(first));
 }
 
+// `node` and its ancestors, innermost first. ts_node_parent costs O(depth),
+// so the chain is built once from the root down.
+std::vector<TSNode> AncestorChain(TSNode node) {
+  std::vector<TSNode> chain;
+  if (ts_node_is_null(node)) return chain;
+  for (TSNode p = ts_tree_root_node(node.tree); !ts_node_is_null(p);
+       p = ts_node_child_with_descendant(p, node)) {
+    chain.push_back(p);
+    if (ts_node_eq(p, node)) break;
+  }
+  if (chain.empty() || !ts_node_eq(chain.back(), node)) {
+    chain.clear();  // not reachable from the root: fall back to parents
+    for (TSNode p = node; !ts_node_is_null(p); p = ts_node_parent(p)) chain.push_back(p);
+    return chain;
+  }
+  std::reverse(chain.begin(), chain.end());
+  return chain;
+}
+
 // The syntactic context of `node`: what return, await, yield, break,
 // continue, super, new.target, arguments, private names, and strictness mean
 // at that position.
@@ -336,8 +367,11 @@ GenContext ContextFor(TSNode node, std::string_view source) {
   bool barrier = false;   // crossed a function or class-element boundary
   bool fn_set = false;    // return/await/yield decided
   bool settled = false;   // super/new.target/arguments decided
-  TSNode child = node;
-  for (TSNode p = node; !ts_node_is_null(p); child = p, p = ts_node_parent(p)) {
+  const std::vector<TSNode> chain = AncestorChain(node);
+  for (size_t i = 0; i < chain.size(); ++i) {
+    const TSNode p = chain[i];
+    const TSNode child = i == 0 ? node : chain[i - 1];
+    const TSNode parent = i + 1 < chain.size() ? chain[i + 1] : TSNode{};
     const char* type = ts_node_type(p);
     if (!barrier) {
       if (IsLoopType(type) && !ts_node_eq(p, node)) c.loop = true;
@@ -359,9 +393,8 @@ GenContext ContextFor(TSNode node, std::string_view source) {
       c.strict = true;
     }
     if ((std::strcmp(type, "program") == 0 ||
-         (std::strcmp(type, "statement_block") == 0 &&
-          !ts_node_is_null(ts_node_parent(p)) &&
-          IsFunctionType(ts_node_type(ts_node_parent(p))))) &&
+         (std::strcmp(type, "statement_block") == 0 && !ts_node_is_null(parent) &&
+          IsFunctionType(ts_node_type(parent)))) &&
         ListIsStrict(p, source)) {
       c.strict = true;
     }
@@ -401,12 +434,12 @@ GenContext ContextFor(TSNode node, std::string_view source) {
     c.new_target = true;
     if (std::strcmp(type, "method_definition") == 0) {
       c.super_property = true;
-      TSNode owner = ts_node_parent(p);
-      if (Is(owner, "class_body") && !IsStaticMember(p)) {
+      const TSNode owner = parent;
+      if (Is(owner, "class_body") && !IsStaticMember(p) && i + 2 < chain.size()) {
         const std::string name = MemberName(p, source);
         if (name == "constructor" || name == "'constructor'" ||
             name == "\"constructor\"") {
-          c.super_call = ClassIsDerived(ts_node_parent(owner));
+          c.super_call = ClassIsDerived(chain[i + 2]);
         }
       }
     }
@@ -536,8 +569,7 @@ void DeclaredNames(TSNode statement, std::string_view source,
 std::vector<std::string> VisibleNames(TSNode node, std::string_view source,
                                       Budget* budget) {
   std::vector<std::string> names;
-  TSNode child = node;
-  for (TSNode p = node; !ts_node_is_null(p); child = p, p = ts_node_parent(p)) {
+  for (TSNode p : AncestorChain(node)) {
     const char* type = ts_node_type(p);
     if (std::strcmp(type, "program") == 0 ||
         std::strcmp(type, "statement_block") == 0) {
@@ -578,7 +610,6 @@ std::vector<std::string> VisibleNames(TSNode node, std::string_view source,
     }
     if (budget->exhausted) break;
   }
-  (void)child;
   return names;
 }
 
@@ -656,6 +687,87 @@ bool IsAlwaysReservedWord(std::string_view name) {
     if (name == word) return true;
   }
   return false;
+}
+
+// Tree-sitter reads a block holding one labelled statement or a comma list
+// as an object literal: `{ L: function f() {} }`, `() => { a: 1, b: 2 }`.
+// V8 reads a block there, since no expression statement starts with `{`.
+enum class BlockRead { kValid, kSloppyOnly, kInvalid };
+
+BlockRead ReadAsBlock(TSNode object, std::string_view source, unsigned depth = 0) {
+  if (depth > 16) return BlockRead::kInvalid;
+  BlockRead result = BlockRead::kValid;
+  auto name_read = [&](TSNode name) {
+    const std::string_view text = NodeText(name, source);
+    if (text.find('\\') != std::string_view::npos || IsAlwaysReservedWord(text) ||
+        text == "await" || text == "yield") {
+      return BlockRead::kInvalid;
+    }
+    return IsStrictReservedWord(text) ? BlockRead::kSloppyOnly : BlockRead::kValid;
+  };
+  std::vector<TSNode> elements;
+  const uint32_t count = ts_node_child_count(object);
+  for (uint32_t i = 0; i < count; ++i) {
+    TSNode child = ts_node_child(object, i);
+    if (IsExtra(child)) continue;
+    if (!ts_node_is_named(child)) {
+      // `{ a, }`: a trailing comma ends no expression.
+      if (NodeText(child, source) == "," && i + 1 < count &&
+          NodeText(ts_node_child(object, i + 1), source) == "}") {
+        return BlockRead::kInvalid;
+      }
+      continue;
+    }
+    elements.push_back(child);
+  }
+  for (size_t i = 0; i < elements.size(); ++i) {
+    TSNode element = elements[i];
+    BlockRead read = BlockRead::kInvalid;
+    if (Is(element, "shorthand_property_identifier")) {
+      read = name_read(element);
+    } else if (Is(element, "pair") && i == 0) {
+      // `L: value`, a labelled statement.
+      TSNode key = Field(element, "key");
+      TSNode value = Field(element, "value");
+      read = Is(key, "property_identifier") ? name_read(key) : BlockRead::kInvalid;
+      const bool last = elements.size() == 1;
+      if (Is(value, "function_expression")) {
+        // A labelled function declaration: sloppy code only, named, not async.
+        const bool plain = !ts_node_is_null(Field(value, "name")) &&
+                           !HasDirectToken(value, "async");
+        read = std::max(read, plain && last ? BlockRead::kSloppyOnly : BlockRead::kInvalid);
+      } else if (Is(value, "generator_function") || Is(value, "class")) {
+        read = BlockRead::kInvalid;
+      } else if (Is(value, "object")) {
+        read = last ? std::max(read, ReadAsBlock(value, source, depth + 1))
+                    : BlockRead::kInvalid;
+      }
+    }
+    result = std::max(result, read);
+  }
+  return result;
+}
+
+// How V8 reads an expression statement or arrow body that Tree-sitter took
+// for an object literal; kValid when there is none.
+BlockRead ReadMisparsedBlock(TSNode node, std::string_view source) {
+  TSNode object{};
+  if (Is(node, "expression_statement")) {
+    object = ts_node_child(node, 0);
+  } else if (Is(node, "arrow_function")) {
+    object = Field(node, "body");
+  }
+  return Is(object, "object") ? ReadAsBlock(object, source) : BlockRead::kValid;
+}
+
+// The name `export * as name from` exports. Tree-sitter keeps `default`
+// there as an anonymous token.
+std::string NamespaceExportName(TSNode ns, std::string_view source) {
+  TSNode name = ts_node_named_child(ns, 0);
+  if (ts_node_is_null(name)) return HasDirectToken(ns, "default") ? "default" : "";
+  std::string text = CanonicalName(NodeText(name, source));
+  if (Is(name, "string") && text.size() >= 2) text = text.substr(1, text.size() - 2);
+  return text;
 }
 
 TSNode SkipParens(TSNode node) {
@@ -768,7 +880,7 @@ bool HasSimpleParameters(TSNode function) {
 // Code that is only legal in sloppy mode. `in_generator` and `in_async` say
 // whether the node is inside a generator or async function of the subtree.
 bool IsSloppyOnlyNode(TSNode node, std::string_view source, bool in_generator,
-                      bool in_async) {
+                      bool in_async, bool module) {
   static constexpr std::string_view kStrictReserved[] = {
       "let", "static", "yield", "implements", "interface", "package",
       "private", "protected", "public", "await", "using"};
@@ -778,7 +890,7 @@ bool IsSloppyOnlyNode(TSNode node, std::string_view source, bool in_generator,
     if (IsIdentifierNode(node)) {
       const std::string name = DecodeIdentifier(NodeText(node, source));
       for (std::string_view word : kStrictReserved) {
-        if (name == word) found = true;
+        if (name == word && (module || word != "await")) found = true;
       }
       if (IsEvalOrArguments(name) && IsBindingOrTarget(node)) found = true;
       return found;
@@ -804,7 +916,9 @@ bool IsSloppyOnlyNode(TSNode node, std::string_view source, bool in_generator,
       if (params.size() > 1 && HasDuplicate(params)) found = true;
     }
     if (found) return found;
-    if (std::strcmp(type, "with_statement") == 0 || HasLegacySyntax(node, source)) {
+    // Template escapes are no sloppy-mode feature: legal tagged, never untagged.
+    if (std::strcmp(type, "with_statement") == 0 ||
+        (std::strcmp(type, "template_string") != 0 && HasLegacySyntax(node, source))) {
       found = true;
     } else if (std::strcmp(type, "for_in_statement") == 0 &&
                !ts_node_is_null(Field(node, "value"))) {
@@ -817,6 +931,8 @@ bool IsSloppyOnlyNode(TSNode node, std::string_view source, bool in_generator,
                 Is(Field(node, "body"), "function_declaration") ||
                 Is(ts_node_named_child(node, 0), "function_declaration"))) {
       found = true;  // Annex B function declaration as a statement body
+    } else if (ReadMisparsedBlock(node, source) != BlockRead::kValid) {
+      found = true;  // e.g. `{ L: function f() {} }`, a labelled declaration
     } else if (std::strcmp(type, "unary_expression") == 0 &&
                HasDirectToken(node, "delete")) {
       TSNode argument = Field(node, "argument");
@@ -829,13 +945,18 @@ bool IsSloppyOnlyNode(TSNode node, std::string_view source, bool in_generator,
   return found;
 }
 
-bool HasSloppyOnly(TSNode root, std::string_view source, Budget* budget) {
+// `in_generator` and `in_async` describe the code around `root`; `module`
+// reserves `await` as an identifier.
+bool HasSloppyOnly(TSNode root, std::string_view source, Budget* budget,
+                   bool in_generator = false, bool in_async = false,
+                   bool module = true) {
   struct Item {
     TSNode node;
     bool in_generator;
     bool in_async;
   };
-  std::vector<Item> stack = {{root, false, false}};
+  if (ts_node_is_null(root)) return false;
+  std::vector<Item> stack = {{root, in_generator, in_async}};
   while (!stack.empty()) {
     if (budget->node_visits >= kMaxNodeVisits) {
       budget->exhausted = true;
@@ -844,7 +965,9 @@ bool HasSloppyOnly(TSNode root, std::string_view source, Budget* budget) {
     ++budget->node_visits;
     Item item = stack.back();
     stack.pop_back();
-    if (IsSloppyOnlyNode(item.node, source, item.in_generator, item.in_async)) return true;
+    if (IsSloppyOnlyNode(item.node, source, item.in_generator, item.in_async, module)) {
+      return true;
+    }
     bool in_generator = item.in_generator;
     bool in_async = item.in_async;
     if (IsFunctionType(ts_node_type(item.node))) {
@@ -852,9 +975,12 @@ bool HasSloppyOnly(TSNode root, std::string_view source, Budget* budget) {
       in_generator = arrow ? in_generator : IsGeneratorFunction(item.node);
       in_async = (arrow && in_async) || HasDirectToken(item.node, "async");
     }
+    const bool templ = Is(item.node, "template_string");
     const uint32_t count = ts_node_child_count(item.node);
     for (uint32_t i = count; i-- > 0;) {
-      stack.push_back({ts_node_child(item.node, i), in_generator, in_async});
+      TSNode child = ts_node_child(item.node, i);
+      if (templ && !Is(child, "template_substitution")) continue;
+      stack.push_back({child, in_generator, in_async});
     }
   }
   return false;
@@ -1049,8 +1175,9 @@ class EarlyErrors {
   bool Check(TSNode root) {
     State state;
     module_ = IsModuleSource(source_);
+    repl_ = IsReplSource(source_);
     if (module_) CheckModule(root);
-    Visit(root, state, 0);
+    Visit(root, TSNode{}, state, 0);
     if (budget_->exhausted) error_ = true;  // unknown counts as invalid
     return error_;
   }
@@ -1067,6 +1194,7 @@ class EarlyErrors {
     bool generator = false;       // directly in a generator body
     bool await_reserved = false;  // async code, static blocks, class bodies
     bool yield_reserved = false;  // generator code
+    bool no_arguments = false;    // field initializers and static blocks
   };
 
   // Lexically declared names of one scope, for var-hoisting conflicts.
@@ -1316,6 +1444,29 @@ class EarlyErrors {
     error_ = true;
   }
 
+  // In async code Tree-sitter reads `await (x)()` and `await (x)` + template
+  // as a call of an identifier `await`; V8 reads an await expression.
+  bool IsMisreadAwait(TSNode id, TSNode call) {
+    if (!Is(call, "call_expression") || !ts_node_eq(Field(call, "function"), id) ||
+        NodeText(id, source_) != "await" || !ContextFor(id, source_).async) {
+      return false;
+    }
+    TSNode arguments = Field(call, "arguments");
+    if (Is(arguments, "template_string")) return true;
+    if (!Is(arguments, "arguments") || ts_node_named_child_count(arguments) == 0) return false;
+    // `(a, b)` must also read as a parenthesized expression.
+    const uint32_t count = ts_node_child_count(arguments);
+    for (uint32_t i = 0; i < count; ++i) {
+      TSNode child = ts_node_child(arguments, i);
+      if (Is(child, "spread_element")) return false;
+      if (NodeText(child, source_) == "," && i + 1 < count &&
+          NodeText(ts_node_child(arguments, i + 1), source_) == ")") {
+        return false;
+      }
+    }
+    return true;
+  }
+
   void CheckIdentifier(TSNode node, const State& state) {
     const std::string_view raw = NodeText(node, source_);
     const std::string name = DecodeIdentifier(raw);
@@ -1327,11 +1478,14 @@ class EarlyErrors {
         return;
       }
     }
-    if (raw.find('\\') != std::string_view::npos && IsAlwaysReservedWord(name)) {
+    if (state.no_arguments && name == "arguments") {
+      error_ = true;
+    } else if (raw.find('\\') != std::string_view::npos && IsAlwaysReservedWord(name)) {
       error_ = true;
     } else if (state.strict && IsStrictReservedWord(name)) {
       error_ = true;
-    } else if (state.await_reserved && name == "await") {
+    } else if (state.await_reserved && name == "await" &&
+               !IsMisreadAwait(node, ts_node_parent(node))) {
       error_ = true;
     } else if (state.yield_reserved && name == "yield") {
       error_ = true;
@@ -1420,16 +1574,66 @@ class EarlyErrors {
     }
   }
 
-  void Visit(TSNode node, State& state, unsigned depth) {
-    if (error_ || ts_node_is_null(node) || depth > kMaxCheckDepth) return;
+  // The recursion keeps its frame small: per-node work lives in VisitNode,
+  // which is not inlined, so deep input fits the stack under ASan too.
+  void Visit(TSNode node, TSNode parent, const State& state, unsigned depth) {
+    if (error_ || ts_node_is_null(node)) return;
+    if (depth > kMaxCheckDepth) {
+      error_ = true;  // too deep to check: unknown counts as invalid
+      return;
+    }
     if (budget_->node_visits >= kMaxNodeVisits) {
       budget_->exhausted = true;
       return;
     }
     ++budget_->node_visits;
+    const size_t frames = frames_.size();
+    std::unique_ptr<State> inner;
+    if (VisitNode(node, parent, state, &inner)) {
+      const State& next = inner ? *inner : state;
+      const char* type = ts_node_type(node);
+      // A method's computed key is outside its (possibly strict) body.
+      const TSNode method_key = std::strcmp(type, "method_definition") == 0
+                                    ? Field(node, "name") : TSNode{};
+      const bool member = std::strcmp(type, "field_definition") == 0 ||
+                          std::strcmp(type, "method_definition") == 0;
+      // A field initializer may not use `arguments`; its key may.
+      const TSNode field_value = std::strcmp(type, "field_definition") == 0
+                                     ? Field(node, "value") : TSNode{};
+      std::unique_ptr<State> field_state;
+      if (!ts_node_is_null(field_value)) {
+        field_state = std::make_unique<State>(next);
+        field_state->no_arguments = true;
+      }
+      const uint32_t count = ts_node_named_child_count(node);
+      for (uint32_t i = 0; i < count && !error_; ++i) {
+        TSNode child = ts_node_named_child(node, i);
+        // Declaration names of private members are not references.
+        if (member && Is(child, "private_property_identifier")) continue;
+        const bool key = !ts_node_is_null(method_key) && ts_node_eq(child, method_key);
+        const bool value = field_state && ts_node_eq(child, field_value);
+        Visit(child, node, key ? state : value ? *field_state : next, depth + 1);
+      }
+    }
+    frames_.resize(frames);
+  }
+
+  static bool ChangesState(const char* type) {
+    return IsFunctionType(type) || IsLoopType(type) ||
+           std::strcmp(type, "class_static_block") == 0 ||
+           std::strcmp(type, "switch_statement") == 0 ||
+           std::strcmp(type, "labeled_statement") == 0 ||
+           std::strcmp(type, "class_body") == 0 || std::strcmp(type, "program") == 0 ||
+           std::strcmp(type, "class") == 0 || std::strcmp(type, "class_declaration") == 0;
+  }
+
+  // Checks one node and pushes its lexical frames. Sets `*inner` when the
+  // node changes the state of its children; returns whether to visit them.
+  [[gnu::noinline]] bool VisitNode(TSNode node, TSNode parent, const State& state,
+                                   std::unique_ptr<State>* inner_out) {
     const char* type = ts_node_type(node);
-    CheckGoalAndUsing(node, type);
-    if (error_) return;
+    CheckGoalAndUsing(node, parent, type);
+    if (error_) return false;
 
     if (std::strcmp(type, "break_statement") == 0) {
       TSNode label = Field(node, "label");
@@ -1442,7 +1646,7 @@ class EarlyErrors {
       } else if (state.loops == 0 && state.switches == 0) {
         error_ = true;
       }
-      return;
+      return false;
     }
     if (std::strcmp(type, "continue_statement") == 0) {
       TSNode label = Field(node, "label");
@@ -1455,25 +1659,25 @@ class EarlyErrors {
       } else if (state.loops == 0) {
         error_ = true;
       }
-      return;
+      return false;
     }
     if (std::strcmp(type, "return_statement") == 0 && !state.in_function) {
       error_ = true;
-      return;
+      return false;
     }
     if (std::strcmp(type, "private_property_identifier") == 0) {
       if (!PrivateVisible(state, Text(node))) error_ = true;
-      return;
+      return false;
     }
+    CheckMisparsedBlock(node, state);
+    if (error_) return false;
 
     if (std::strcmp(type, "program") == 0 || std::strcmp(type, "statement_block") == 0) {
-      TSNode parent = ts_node_parent(node);
-      const bool function_level = std::strcmp(type, "program") == 0 ||
-                                  (!ts_node_is_null(parent) &&
-                                   IsFunctionType(ts_node_type(parent)));
+      const bool program = std::strcmp(type, "program") == 0;
+      const bool function_body = !ts_node_is_null(parent) && IsFunctionType(ts_node_type(parent));
       std::vector<std::string> outer;
       outer_lexical_params_.clear();
-      if (!ts_node_is_null(parent) && IsFunctionType(ts_node_type(parent))) {
+      if (function_body) {
         // Parameters conflict with lexical declarations in the body.
         CollectPattern(Field(parent, "parameters"), &outer, 0);
         CollectPattern(Field(parent, "parameter"), &outer, 0);
@@ -1482,8 +1686,9 @@ class EarlyErrors {
         CollectPattern(Field(parent, "parameter"), &outer, 0);
         outer_lexical_params_.insert(outer.begin(), outer.end());
       }
-      CheckList(ListStatements(node), function_level, ContextFor(node, source_).strict,
-                outer);
+      // A function's own state already includes its body's directive.
+      const bool strict = program ? module_ || ListIsStrict(node, source_) : state.strict;
+      CheckList(ListStatements(node), program || function_body, strict, outer);
       outer_lexical_params_.clear();
     } else if (std::strcmp(type, "switch_body") == 0) {
       std::vector<TSNode> statements;
@@ -1497,82 +1702,99 @@ class EarlyErrors {
           if (!ts_node_eq(child, value) && !IsExtra(child)) statements.push_back(child);
         }
       }
-      CheckList(statements, false, ContextFor(node, source_).strict, {});
+      CheckList(statements, false, state.strict, {});
     } else if (std::strcmp(type, "class_body") == 0) {
       CheckClassBody(node);
     }
+    if (error_) return false;
 
-    State inner = state;
-    bool changed = false;
-    if (IsFunctionType(type)) {
-      inner.in_function = true;
-      inner.loops = 0;
-      inner.switches = 0;
-      inner.labels.clear();
-      inner.loop_labels.clear();
-      changed = true;
-    } else if (std::strcmp(type, "class_static_block") == 0) {
-      inner.in_function = false;
-      inner.loops = 0;
-      inner.switches = 0;
-      inner.labels.clear();
-      inner.loop_labels.clear();
-      changed = true;
-    } else if (IsLoopType(type)) {
-      ++inner.loops;
-      changed = true;
-    } else if (std::strcmp(type, "switch_statement") == 0) {
-      ++inner.switches;
-      changed = true;
-    } else if (std::strcmp(type, "labeled_statement") == 0) {
-      const std::string label = Text(Field(node, "label"));
-      if (std::find(inner.labels.begin(), inner.labels.end(), label) !=
-          inner.labels.end()) {
+    if (ChangesState(type)) {
+      auto inner = std::make_unique<State>(state);
+      if (IsFunctionType(type) || std::strcmp(type, "class_static_block") == 0) {
+        inner->in_function = IsFunctionType(type);
+        // Arrows see the `arguments` of the code around them.
+        if (std::strcmp(type, "arrow_function") != 0) {
+          inner->no_arguments = !inner->in_function;
+        }
+        inner->loops = 0;
+        inner->switches = 0;
+        inner->labels.clear();
+        inner->loop_labels.clear();
+      } else if (IsLoopType(type)) {
+        ++inner->loops;
+      } else if (std::strcmp(type, "switch_statement") == 0) {
+        ++inner->switches;
+      } else if (std::strcmp(type, "labeled_statement") == 0) {
+        const std::string label = Text(Field(node, "label"));
+        if (std::find(inner->labels.begin(), inner->labels.end(), label) !=
+            inner->labels.end()) {
+          error_ = true;
+          return false;
+        }
+        inner->labels.push_back(label);
+        TSNode body = Field(node, "body");
+        if (!ts_node_is_null(body) && IsLoopType(ts_node_type(body))) {
+          inner->loop_labels.push_back(label);
+        }
+      } else if (std::strcmp(type, "class_body") == 0) {
+        std::vector<std::string> declared;
+        CollectPrivateDeclarations(node, source_, &declared);
+        inner->privates.push_back(declared);
+      }
+      UpdateNameState(node, inner.get());
+      // Strict code entered here: module code is checked as a whole already.
+      if (inner->strict && !state.strict && !module_ && StrictRegionHasSloppyOnly(node)) {
         error_ = true;
-        return;
+        return false;
       }
-      inner.labels.push_back(label);
-      TSNode body = Field(node, "body");
-      if (!ts_node_is_null(body) && IsLoopType(ts_node_type(body))) {
-        inner.loop_labels.push_back(label);
-      }
-      changed = true;
-    } else if (std::strcmp(type, "class_body") == 0) {
-      std::vector<std::string> declared;
-      CollectPrivateDeclarations(node, source_, &declared);
-      inner.privates.push_back(declared);
-      changed = true;
+      *inner_out = std::move(inner);
     }
-    if (UpdateNameState(node, &inner)) changed = true;
-    State& next = changed ? inner : state;
-    CheckNames(node, state, next);
-    if (error_) return;
+    CheckNames(node, state, *inner_out ? **inner_out : state);
+    if (error_) return false;
 
     // Scopes whose lexical names conflict with var declarations inside.
-    const size_t frames = frames_.size();
     if (IsFunctionType(type) || std::strcmp(type, "class_static_block") == 0) {
       frames_.emplace_back();
       frames_.back().boundary = true;
     }
     LexicalFrame frame;
     if (LexicalFrameFor(node, &frame)) frames_.push_back(std::move(frame));
+    return true;
+  }
 
-    // A method's computed key is outside its (possibly strict) body.
-    const TSNode method_key = std::strcmp(type, "method_definition") == 0
-                                  ? Field(node, "name") : TSNode{};
-    const uint32_t count = ts_node_named_child_count(node);
-    for (uint32_t i = 0; i < count && !error_; ++i) {
-      TSNode child = ts_node_named_child(node, i);
-      // Declaration names of private members are not references.
-      if (Is(child, "private_property_identifier") &&
-          (std::strcmp(type, "field_definition") == 0 ||
-           std::strcmp(type, "method_definition") == 0)) {
-        continue;
-      }
-      Visit(child, !ts_node_is_null(method_key) && ts_node_eq(child, method_key) ? state : next,
-            depth + 1);
+  // Strict-only errors in a strict region of a script. A method's computed
+  // key stays outside its strict body.
+  bool StrictRegionHasSloppyOnly(TSNode node) {
+    if (Is(node, "method_definition")) {
+      const bool generator = IsGeneratorFunction(node);
+      const bool async = HasDirectToken(node, "async");
+      return IsSloppyOnlyNode(node, source_, generator, async, false) ||
+             HasSloppyOnly(Field(node, "parameters"), source_, budget_, generator, async,
+                           false) ||
+             HasSloppyOnly(Field(node, "body"), source_, budget_, generator, async, false);
     }
-    frames_.resize(frames);
+    const GenContext context = ContextFor(node, source_);
+    return HasSloppyOnly(node, source_, budget_, context.generator, context.async, false);
+  }
+
+  // Blocks Tree-sitter took for object literals (see ReadAsBlock).
+  void CheckMisparsedBlock(TSNode node, const State& state) {
+    if (!Is(node, "expression_statement") && !Is(node, "arrow_function")) return;
+    const BlockRead read = ReadMisparsedBlock(node, source_);
+    if (read == BlockRead::kInvalid || (read == BlockRead::kSloppyOnly && state.strict)) {
+      error_ = true;
+      return;
+    }
+    TSNode object = Is(node, "arrow_function") ? Field(node, "body") : ts_node_child(node, 0);
+    if (!Is(object, "object")) return;
+    // `L: { L: 0 }` repeats a label.
+    TSNode pair = ts_node_named_child(object, 0);
+    if (Is(pair, "pair")) {
+      const std::string label = Text(Field(pair, "key"));
+      if (std::find(state.labels.begin(), state.labels.end(), label) != state.labels.end()) {
+        error_ = true;
+      }
+    }
   }
 
   // Strictness and whether await/yield are reserved inside `node`.
@@ -1664,7 +1886,7 @@ class EarlyErrors {
   }
 
   // `using` declarations, `await` placement, and what each goal allows.
-  void CheckGoalAndUsing(TSNode node, const char* type) {
+  void CheckGoalAndUsing(TSNode node, TSNode parent, const char* type) {
     if (std::strcmp(type, "using_declaration") == 0) {
       TSNode await_token = DirectToken(node, "await");
       if (!IsRealUsing(node, source_)) {
@@ -1672,7 +1894,6 @@ class EarlyErrors {
         if (!ts_node_is_null(await_token)) error_ = true;
         return;
       }
-      TSNode parent = ts_node_parent(node);
       if (!Is(parent, "statement_block") && !(module_ && Is(parent, "program"))) {
         error_ = true;  // script top level, switch case, or statement position
       }
@@ -1727,7 +1948,7 @@ class EarlyErrors {
     }
     if (std::strcmp(type, "import_statement") == 0 ||
         std::strcmp(type, "export_statement") == 0) {
-      if (!module_ || !Is(ts_node_parent(node), "program")) error_ = true;
+      if (!module_ || !Is(parent, "program")) error_ = true;
       return;
     }
     if (std::strcmp(type, "meta_property") == 0) {
@@ -1750,9 +1971,14 @@ class EarlyErrors {
       }
       return;
     }
+    // REPL code is an async function body: `await` is no identifier there.
+    if (repl_ && IsIdentifierLike(type) && Text(node) == "await") error_ = true;
     if (!module_) return;
     if (std::strcmp(type, "html_comment") == 0) error_ = true;
-    if (std::strcmp(type, "identifier") == 0 && Text(node) == "await") error_ = true;
+    if (std::strcmp(type, "identifier") == 0 && Text(node) == "await" &&
+        !IsMisreadAwait(node, parent)) {
+      error_ = true;
+    }
   }
 
   // The value of a module export name or property key: strings lose quotes.
@@ -1765,7 +1991,8 @@ class EarlyErrors {
   // Module top level: imports and top-level functions are lexical, exported
   // names are unique, and local exports must resolve.
   void CheckModule(TSNode root) {
-    if (HasSloppyOnly(root, source_, budget_)) error_ = true;
+    // Module top level is async: top-level await is fine.
+    if (HasSloppyOnly(root, source_, budget_, false, true)) error_ = true;
     std::set<std::string> lexical;
     std::set<std::string> exports;
     std::vector<std::string> locals;
@@ -1791,7 +2018,7 @@ class EarlyErrors {
           for (uint32_t i = 0; i < count; ++i) {
             TSNode child = ts_node_named_child(s, i);
             if (Is(child, "namespace_export")) {
-              export_name(NameValue(ts_node_named_child(child, 0)));
+              export_name(NamespaceExportName(child, source_));
             } else if (Is(child, "export_clause")) {
               const uint32_t specs = ts_node_named_child_count(child);
               for (uint32_t j = 0; j < specs; ++j) {
@@ -1871,6 +2098,7 @@ class EarlyErrors {
   Budget* budget_;
   bool error_ = false;
   bool module_ = false;
+  bool repl_ = false;
   std::set<std::string> plain_functions_;
   std::set<std::string> outer_lexical_params_;
   std::vector<LexicalFrame> frames_;
@@ -2693,7 +2921,7 @@ std::vector<std::string> ModuleExportNames(TSNode root, std::string_view source)
     const uint32_t count = ts_node_named_child_count(statement);
     for (uint32_t i = 0; i < count; ++i) {
       TSNode child = ts_node_named_child(statement, i);
-      if (Is(child, "namespace_export")) value(ts_node_named_child(child, 0));
+      if (Is(child, "namespace_export")) out.push_back(NamespaceExportName(child, source));
       if (!Is(child, "export_clause")) continue;
       const uint32_t specs = ts_node_named_child_count(child);
       for (uint32_t j = 0; j < specs; ++j) {
@@ -2823,6 +3051,60 @@ std::string MagicCommentLine(Random* random, bool at_start) {
   return line;
 }
 
+// `//# functionsCalledOnLoad=` naming functions that follow a comment
+// inserted at `position`, with the `drop` ranges removed. V8 matches each
+// position, within 3, against the `(` of a function's parameters (or an
+// arrow's parameter start), counted from the line terminator that ends the
+// comment. The set is closed upward: a hinted function's enclosing functions
+// are hinted too, since lazily compiled code ignores the hints inside it.
+std::string FunctionHintLine(Mutation& m, size_t position,
+                             const std::vector<std::pair<size_t, size_t>>& drop) {
+  struct Function {
+    size_t params;
+    size_t start;
+    size_t end;
+  };
+  std::vector<Function> functions;
+  Walk(m.root, m.budget, [&](TSNode node, TSNode) {
+    if (!IsFunctionType(ts_node_type(node))) return true;
+    TSNode params = Field(node, "parameters");
+    if (ts_node_is_null(params)) params = Field(node, "parameter");
+    if (!ts_node_is_null(params) && ts_node_start_byte(params) >= position) {
+      functions.push_back({ts_node_start_byte(params), ts_node_start_byte(node),
+                           ts_node_end_byte(node)});
+    }
+    return functions.size() < 256;
+  });
+  std::vector<bool> hinted(functions.size(), false);
+  const size_t picks = functions.empty() ? 0 : 1 + m.random->Below(4);
+  for (size_t i = 0; i < picks; ++i) {
+    const Function& f = functions[m.random->Below(static_cast<uint32_t>(functions.size()))];
+    for (size_t j = 0; j < functions.size(); ++j) {
+      if (functions[j].start <= f.start && f.end <= functions[j].end) hinted[j] = true;
+    }
+  }
+  // Offsets in the output, relative to the comment's line terminator.
+  std::vector<int> positions;
+  for (size_t j = 0; j < functions.size(); ++j) {
+    if (!hinted[j]) continue;
+    size_t removed = 0;
+    for (const auto& range : drop) {
+      if (range.first >= position && range.second <= functions[j].params) {
+        removed += range.second - range.first;
+      }
+    }
+    positions.push_back(static_cast<int>(functions[j].params - position - removed + 1));
+  }
+  std::sort(positions.begin(), positions.end());
+  std::vector<int> deltas;
+  int last = 0;
+  for (int p : positions) {
+    deltas.push_back(p - last);
+    last = p;
+  }
+  return "//# functionsCalledOnLoad=" + Base64Vlq(deltas);
+}
+
 std::optional<std::string> EditMagicComment(Mutation& m) {
   // Idempotent: drop existing magic comments, then rebuild a fresh set.
   std::vector<std::pair<size_t, size_t>> drop;
@@ -2872,9 +3154,15 @@ std::optional<std::string> EditMagicComment(Mutation& m) {
     block += line;
     previous = std::move(line);
   }
+  if (position != 0 && m.source[position - 1] != '\n') block.insert(0, "\n");
+  std::sort(drop.begin(), drop.end());
+  if (!at_eof && m.random->Chance(60)) {
+    // Usually end with hints that name real functions after the comment.
+    block += '\n';
+    block += FunctionHintLine(m, position, drop);
+  }
   // A comment at EOF may end without a line terminator.
   if (!at_eof || m.random->Chance(50)) block += '\n';
-  if (position != 0 && m.source[position - 1] != '\n') block.insert(0, "\n");
   std::string out;
   size_t cursor = 0;
   auto copy_until = [&](size_t end) {
@@ -2886,7 +3174,6 @@ std::optional<std::string> EditMagicComment(Mutation& m) {
     if (end > cursor) out.append(m.source.substr(cursor, end - cursor));
     cursor = std::max(cursor, end);
   };
-  std::sort(drop.begin(), drop.end());
   copy_until(position);
   out += block;
   copy_until(m.source.size());
@@ -3239,8 +3526,10 @@ std::optional<std::string> EditPrivateRename(Mutation& m) {
 // only without sloppy-only code; a module becomes a valid script only
 // without imports, exports, import.meta, or top-level await. The checker
 // decides which side of that line a result is on.
+// Script to Module, REPL or eval, and back. The checker decides whether the
+// tagged source is still valid.
 std::optional<std::string> EditFlipGoal(Mutation& m) {
-  if (IsModuleSource(m.source)) {
+  if (GoalTag(m.source) != nullptr) {
     size_t end = internal::kModuleTag.size();
     if (end < m.source.size() && m.source[end] == '\n') ++end;
     return Replace(m.source, 0, end, "", m.limit);
@@ -3250,7 +3539,11 @@ std::optional<std::string> EditFlipGoal(Mutation& m) {
     const size_t line_end = body.find('\n');
     body = line_end == std::string_view::npos ? std::string_view{} : body.substr(line_end + 1);
   }
-  std::string out = std::string(internal::kModuleTag) + "\n" + std::string(body);
+  const uint32_t pick = m.random->Below(10);
+  const std::string_view tag = pick < 2   ? internal::kEvalTag
+                               : pick < 4 ? internal::kReplTag
+                                          : internal::kModuleTag;
+  std::string out = std::string(tag) + "\n" + std::string(body);
   if (out.size() > m.limit) return std::nullopt;
   return out;
 }
@@ -4161,6 +4454,17 @@ Result MutateImpl(const uint8_t* data, size_t size, const uint8_t* donor,
              {EditKind::kParamScope, 4},         {EditKind::kUnwrap, 4},
              {EditKind::kDeleteRange, 3},        {EditKind::kDeepen, 2},
              {EditKind::kPrivateRename, 6},      {EditKind::kFlipGoal, 3}};
+    // These edits make collisions and goal changes that only the checker
+    // filters; on a parent that already fails the check nothing would.
+    if (*parent_errors != 0 || parent_early) {
+      rules.erase(std::remove_if(rules.begin(), rules.end(),
+                                 [](const Weighted& rule) {
+                                   return rule.kind == EditKind::kRebind ||
+                                          rule.kind == EditKind::kPrivateRename ||
+                                          rule.kind == EditKind::kFlipGoal;
+                                 }),
+                  rules.end());
+    }
     ScaleForFill(source.size(), m.limit, &rules);
     if (*parent_errors != 0) rules.push_back({EditKind::kRepairSyntax, 60});
     if (donor_tree) rules.push_back({EditKind::kCrossOver, 70});
