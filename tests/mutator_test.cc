@@ -258,11 +258,27 @@ int main() {
   for (uint32_t seed = 1; seed <= 300; ++seed) {
     const auto result = test::Mutate(parents[1], 4096, seed, 0);
     Require(result.outcome == Outcome::kEditedMalformed, "malformed mode did not edit");
-    if (!syntax.Parses(result.source) || result.edit == EditKind::kInjectEarlyError) {
+    if (!syntax.Parses(result.source) || result.edit == EditKind::kInjectEarlyError ||
+        result.edit == EditKind::kRegexMalformed) {
       ++broken_outputs;
     }
   }
   Require(broken_outputs == 300, "malformed mode produced valid output");
+
+  // Regexp corruptions edit a seed literal, or add a broken one when the seed
+  // has none.
+  for (const std::string& parent : {parents[5], parents[1]}) {
+    unsigned regex_edits = 0;
+    for (uint32_t seed = 1; seed <= 400; ++seed) {
+      const auto result = test::Mutate(parent, 4096, seed, 0);
+      if (result.edit != EditKind::kRegexMalformed) continue;
+      ++regex_edits;
+      Require(result.source != parent, "a regexp corruption changed nothing");
+      Require(syntax.Types(result.source).count("regex") > 0,
+              "a regexp corruption left no regexp literal:\n" + result.source);
+    }
+    Require(regex_edits >= 40, "regexp corruptions are rare: " + parent);
+  }
 
   // Crossover transplants code from the donor into the parent.
   const std::string donor = "function helper(z) { return z * 3; }\nhelper(4);";

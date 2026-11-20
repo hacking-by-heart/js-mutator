@@ -30,6 +30,7 @@ enum class EditKind {
   kCapture,             // reference a binding from a closure, eval or TDZ position
   kRebind,              // redeclare or shadow a visible name
   kMagicComment,        // rebuild //# sourceURL, debugId, compile-hint comments
+  kRegexMalformed,      // malformed mode: a regexp syntax error or bad flags
 };
 
 struct Config {

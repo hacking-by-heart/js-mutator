@@ -26,7 +26,9 @@ libFuzzer parent (corpus entry)          second input (crossover)
 
 ## Vocabulary and grammar
 
-`generator.h` compiles in the JavaScript keyword and punctuator tables. Identifiers, numbers (decimal, hex, octal, binary, exponents, separators, BigInt, legacy octal in sloppy code), strings (every escape form, line continuations), templates (substitutions, and the invalid escapes that only tagged templates allow), and regular expressions (groups, named groups, backreferences, lookaround, quantifiers, Unicode properties, `v`-mode sets, flags) come from lexical rules.
+`generator.h` compiles in the JavaScript keyword and punctuator tables. Identifiers, numbers (decimal, hex, octal, binary, exponents, separators, BigInt, legacy octal in sloppy code), strings (every escape form, line continuations), templates (substitutions, and the invalid escapes that only tagged templates allow), and regular expressions come from lexical rules.
+
+Regular expressions are built in two passes for one mode (legacy, `u` or `v`). The first pass plans groups under a depth and size budget and leaves placeholders for back references; the second resolves them once every capture and name is known, so forward and self references (numbered and `\k<name>`) appear. Group names may repeat only in sibling alternatives. The grammar covers modifier groups such as `(?i-s:...)`, lookaround, quantifiers, Unicode escapes and properties, Annex B escapes and non-quantifier braces in legacy mode only, and the `v`-mode class set grammar: unions, `&&` and `--` never mixed at one level, nested classes, `\q{...}`, and properties of strings, which never appear under negation. Syntax that needs extra V8 flags is not emitted.
 
 The generator is a recursive grammar over the Script goal. Every rule composes with every other where the language allows it:
 
