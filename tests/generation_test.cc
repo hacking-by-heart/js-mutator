@@ -255,6 +255,10 @@ int main() {
         if (result.source.find(spelling) != std::string::npos) shapes[g] = true;
       }
     }
+    // V8 rejects `new import(x).y` and `new super(x).y`; the callee needs parentheses.
+    Require(result.source.find("new import(") == std::string::npos &&
+                result.source.find("new super(") == std::string::npos,
+            "unparenthesized call as a new callee:\n" + result.source);
     for (const auto& type : syntax.Types(result.source)) ++empty_counts[type];
     syntax.Visit(result.source, [&](TSNode node, std::string_view source) {
       if (!Is(node, "regex")) return;
