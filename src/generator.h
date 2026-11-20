@@ -117,6 +117,8 @@ struct SeedInfo {
   std::vector<std::string> expressions;
   // Self-contained seed functions and classes, usable as building blocks.
   std::vector<std::string> blocks;
+  // Names the module already exports; generated exports avoid them.
+  std::vector<std::string> exports;
 };
 
 // The syntactic context of a position. Constructs such as return, await,
@@ -146,6 +148,8 @@ struct GenContext {
   std::vector<std::string> labels;
   std::vector<std::string> loop_labels;
   std::vector<std::string> private_names;
+  bool module = false;       // Module code: strict, `await` reserved.
+  bool block_level = false;  // `using` declarations legal in this list.
 };
 
 // A recursive generator for ECMAScript Script code. Every production is
@@ -161,6 +165,10 @@ class Generator {
   bool Statement(std::string* out, const GenContext& context, unsigned depth);
   // One expression, parenthesized so it is safe in any expression position.
   bool Expression(std::string* out, const GenContext& context, unsigned depth);
+  // A complete Module program, tagged with a leading /*M*/ comment.
+  bool ModuleProgram(std::string* out, unsigned depth, unsigned max_statements);
+  // One import or export declaration for the top level of a module.
+  bool ModuleItem(std::string* out, const GenContext& context, unsigned depth);
   // A fresh literal of the same lexical kind as a Tree-sitter literal node
   // type (number, string, regex, template_string, true, false, null).
   std::string Literal(std::string_view type, bool strict, bool tagged);
@@ -256,6 +264,13 @@ class Generator {
   std::string ClassText(const GenContext& ctx, unsigned depth, bool declaration,
                         std::string* declared_name);
   std::string ObjectLiteral(const GenContext& ctx, unsigned depth);
+  std::string FunctionLiteral(const GenContext& ctx, unsigned depth);
+  // `using` / `await using` declarations, for-of heads, and look-alikes.
+  std::string UsingStatement(const GenContext& ctx, unsigned depth, bool list);
+  // Modules.
+  std::string ModuleItemImpl(const GenContext& ctx, unsigned depth);
+  std::string ModuleSpecifier();
+  std::string ExportName();
   std::string TemplateLiteral(const GenContext& ctx, unsigned depth,
                               bool tagged);
 
@@ -300,6 +315,7 @@ class Generator {
   std::set<std::string> special_used_;
   // Raw non-ASCII (UTF-8) output for this call; decided once per entry point.
   bool raw_unicode_ = false;
+  std::set<std::string> exported_;
 };
 
 // Words that are identifiers only in sloppy, non-async, non-generator code
@@ -308,6 +324,9 @@ bool IsSpecialName(std::string_view name);
 
 // Early errors that Tree-sitter does not report (implemented in mutator.cc).
 bool HasEarlyErrorForTesting(std::string_view source);
+
+// The tag that marks a source as Module code.
+inline constexpr std::string_view kModuleTag = "/*M*/";
 
 // True when an expression statement starting with `text` would be parsed as
 // something else (a block, declaration, or `let [` declaration).

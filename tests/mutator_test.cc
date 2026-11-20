@@ -255,17 +255,24 @@ int main() {
   }
   Require(repaired >= 20, "invalid parents are rarely repaired");
 
-  // Malformed mode breaks syntax (or injects an early error).
+  // Malformed mode breaks syntax (or injects an early error). A token-level
+  // disruption may also leave only an early error, such as `await f()` in a
+  // script; those stay rare.
   unsigned broken_outputs = 0;
+  unsigned early_disruptions = 0;
   for (uint32_t seed = 1; seed <= 300; ++seed) {
     const auto result = test::Mutate(parents[1], 4096, seed, 0);
     Require(result.outcome == Outcome::kEditedMalformed, "malformed mode did not edit");
     if (!syntax.Parses(result.source) || result.edit == EditKind::kInjectEarlyError ||
-        result.edit == EditKind::kRegexMalformed) {
+        result.edit == EditKind::kRegexMalformed ||
+        result.edit == EditKind::kFlipGoal) {
       ++broken_outputs;
+    } else if (result.edit == EditKind::kDisruptSyntax) {
+      ++early_disruptions;
     }
   }
-  Require(broken_outputs == 300, "malformed mode produced valid output");
+  Require(broken_outputs + early_disruptions == 300, "malformed mode produced valid output");
+  Require(early_disruptions <= 15, "malformed mode rarely breaks the syntax itself");
 
   // Regexp corruptions edit a seed literal, or add a broken one when the seed
   // has none.
@@ -362,7 +369,8 @@ int main() {
       "var v\\u0061r = 1;", "\"use strict\"; (f()) = 1;", "\"use strict\"; f()++;",
       "(f()) ?\?= 1;", "(f()) &&= 1;", "(f``) = 1;", "({a}) = 1;", "([a]) = 1;",
       "(new f()) = 1;", "(a?.b) = 1;", "(import(\"x\")) = 1;", "\"use strict\"; (eval) = 1;",
-      "\"use strict\"; eval++;", "\"use strict\"; for ((f()) of o);"};
+      "\"use strict\"; eval++;", "\"use strict\"; for ((f()) of o);",
+      "{ using r = null; { var r; } }", "{ for (var r in o); using r = null; }"};
   for (const char* source : kEarlyErrors) {
     Require(js_mutator::internal::SourceHasEarlyError(source),
             std::string("checker missed an early error: ") + source);
@@ -483,6 +491,88 @@ int main() {
     }
   }
   Require(cover_errors > 0, "malformed mode never emits cover-grammar errors");
+  // The early-error checker, seen through outcomes: a valid-leaning edit of a
+  // clean parent is never reported malformed, while edits of a parent with an
+  // early error mostly keep it. All of these were checked with V8 15.8.
+  const std::vector<std::string> clean = {
+      "{ using a = null; }", "function f() { using a = g(), b = null; return a; }",
+      "async function f() { await using a = null; for (await using b of c) {} }",
+      "for (using a of b) {}", "class K { static { using a = null; } }",
+      "using[x];\nusing[x] = 1;", "using\nx;", "switch (0) { case 0: { using a = null; } }",
+      "{ using a = 1; { using a = 2; } }", "async () => { for await (using a of b) ; }",
+      "/*M*/\nusing a = null;\nexport { a };",
+      "/*M*/\nawait using b = null;\nfor await (using c of d) ;",
+      "/*M*/\nimport d, * as ns from \"/dev/null\";\nexport { d as \"x y\", ns };",
+      "/*M*/\nexport default class {}\nexport * from \"/dev/null\";",
+      "/*M*/\nexport { f };\nfunction f() {}", "/*M*/\n{ var v; }\nexport { v as default };",
+      "/*M*/\nimport {} from \"/dev/null\" with { mode: \"x\" };\nimport.meta.url;",
+      "/*M*/\nexport * as q from \"/dev/null\";\nexport { default as r, \"s t\" as u } from "
+      "\"/dev/null\";",
+      "/*M*/\nexport default function f() {}\nexport { f as g };",
+      "class O { #a; m() { return class extends (o => o.#a, Object) { #a; [o => #a in o] = 1; "
+      "}; } }"};
+  const std::vector<std::string> early = {
+      "using a = null;", "{ using a; }", "switch (0) { case 0: using a = null; }",
+      "{ using let = 1; }", "class K { static { await using a = null; } }",
+      "function f() { await using a = null; }", "{ using a = 1; var a; }", "export default 1;",
+      "import a from \"/dev/null\";", "import.meta;", "/*M*/\nexport { nope };",
+      "/*M*/\nexport { a as b, c as b };\nvar a, c;", "/*M*/\nvar f;\nfunction f() {}",
+      "/*M*/\nwith (a) {}", "/*M*/\nvar await;", "/*M*/\n{ export {}; }",
+      "/*M*/\nimport a from \"/dev/null\";\nlet a;",
+      "/*M*/\nimport a from \"/dev/null\" with { k: \"1\", k: \"2\" };",
+      "/*M*/\nexport default 1;\nexport default 2;", "/*M*/\nfunction f() { await 0; }",
+      "/*M*/\n<!-- c\n0;", "await f();",
+      "class O { #a; m() { return class extends (o => o.#b, Object) { #b; }; } }"};
+  for (const auto& parent : clean) {
+    Require(syntax.Parses(parent), "clean seed does not parse: " + parent);
+    for (uint32_t seed = 1; seed <= 12; ++seed) {
+      Require(test::Mutate(parent, 4096, seed).outcome != Outcome::kEditedMalformed,
+              "the checker reports an early error in:\n" + parent);
+    }
+  }
+  for (const auto& parent : early) {
+    Require(syntax.Parses(parent), "early-error seed does not parse: " + parent);
+    unsigned kept = 0;
+    for (uint32_t seed = 1; seed <= 12; ++seed) {
+      if (test::Mutate(parent, 4096, seed).outcome == Outcome::kEditedMalformed) ++kept;
+    }
+    Require(kept >= 6, "the checker misses the early error in:\n" + parent);
+  }
+
+  // kPrivateRename renames a declaration with its uses; an inner class that
+  // redeclares the name keeps its own.
+  const std::string classes =
+      "class Outer { #a = 1; #b; static #m() {} f() { return class { #a; g(o) { return o.#a + "
+      "this.#b; } }; } h() { return this.#a; } }";
+  unsigned renamed = 0;
+  unsigned shadow_kept = 0;
+  for (uint32_t seed = 1; seed <= 600; ++seed) {
+    const auto result = test::Mutate(classes, 4096, seed);
+    if (result.edit != EditKind::kPrivateRename) continue;
+    Require(result.outcome == Outcome::kEditedValidLeaning && syntax.Parses(result.source),
+            "a private rename broke the class:\n" + result.source);
+    ++renamed;
+    if (result.source.find("#a = 1") == std::string::npos &&
+        result.source.find("{ #a; g(o) { return o.#a") != std::string::npos) {
+      ++shadow_kept;
+    }
+  }
+  Require(renamed >= 10, "private names are rarely renamed");
+  Require(shadow_kept > 0, "renaming an outer #name changed a shadowing inner class");
+
+  // kFlipGoal turns clean scripts into modules and back; sloppy-only code
+  // never becomes a valid-leaning module.
+  unsigned to_module = 0;
+  unsigned to_script = 0;
+  for (uint32_t seed = 1; seed <= 600; ++seed) {
+    const auto up = test::Mutate(parents[1], 4096, seed);
+    if (up.edit == EditKind::kFlipGoal && up.source.rfind("/*M*/", 0) == 0) ++to_module;
+    const auto down = test::Mutate("/*M*/\nlet x = 1;\n{ using r = null; }", 4096, seed);
+    if (down.edit == EditKind::kFlipGoal && down.source.rfind("/*M*/", 0) != 0) ++to_script;
+    const auto sloppy = test::Mutate("with (a) { b; }\nvar c = 010;", 4096, seed);
+    Require(sloppy.edit != EditKind::kFlipGoal, "sloppy code was flipped to a module");
+  }
+  Require(to_module > 0 && to_script > 0, "the goal flip never happens");
   std::cout << "mutator contract: ok\n";
   return 0;
 }

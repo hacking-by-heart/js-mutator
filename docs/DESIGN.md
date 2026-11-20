@@ -66,6 +66,8 @@ The parent is never discarded. For each edit, the mutator picks a position and c
 | Unwrap | Replace an expression with one of its operands (parenthesized where precedence needs it); functions and classes are never unwrapped |
 | Delete range | Delete 2-8 consecutive statements of one list |
 | Deepen | Nest one expression 16-800 times in context-neutral wrappers (`(…)`, `[…][0]`, `1 ? … : 0`, `!…`, `void …`) with one text splice, bounded by the remaining bytes |
+| Private rename | Rename one `#name` of a class with its uses, to a fresh name, a sibling name, or an outer class's name (shadowing); nested classes that redeclare it keep theirs |
+| Flip goal | Add or remove the `/*M*/` module tag; kept only when the checker finds no early error in the new goal |
 
 Valid mode requires no new Tree-sitter error nodes and no new early errors. An internal checker covers redeclarations (including a `var` that hoists through a lexical declaration of an enclosing block, `for` head, `switch` or destructured catch parameter, and labelled functions), parameter and catch conflicts, duplicate parameters (legal only in sloppy plain functions with simple lists), `"use strict"` with non-simple parameters, function declarations as `if`, label and loop bodies, strict reserved words, `await`/`yield` as names where reserved, `eval`/`arguments` bindings and targets in strict code, escaped keywords, assignment targets (parenthesized patterns, optional chains, `new`, tagged templates, and calls in strict code, with logical operators, or in patterns), `break`/`continue`/`return` targets, duplicate labels, undeclared or duplicate private names, and duplicate constructors. Identifier escapes are decoded before names are compared. A parent that is already invalid can only improve. Valid mode never returns the `;` fallback while a regenerated program fits.
 
@@ -77,4 +79,12 @@ libFuzzer keeps coverage-increasing inputs and hands them back as parents, so co
 
 ## Out of scope
 
-Module code (`import`/`export`, top-level `await`, `import.meta`) is not generated, because the lab harness parses Script code only. Decorators and `using` declarations are newer than the V8 12.5 lab build and are also excluded. JSX is not JavaScript.
+Decorators and auto-accessors (`accessor x`) need `--js-decorators` in V8 15.8 and are not generated; neither are `import.defer` and `import.source`. JSX is not JavaScript.
+
+## Modules, `using`, and class layouts
+
+A source that starts with the comment `/*M*/` is Module code. About one fresh program in ten is a module: imports of every form (default, namespace, named, string names, `with { ... }` attributes with unique keys), exports of declarations, defaults, local names and re-exports, top-level `await`, and `import.meta`. The generator tracks export names, so none is exported twice, and local exports name only top-level bindings. Specifiers are ones d8 can load (`/dev/null`, `data:` URLs) so whole programs can be checked as modules. The checker adds module rules (sloppy-only code, HTML-like comments, `await` as a name, lexical top-level functions and imports, duplicate or unresolvable exports, import and export only at the top level) and script rules (no import, export, `import.meta`, or top-level `await`).
+
+`using` and `await using` declarations appear in blocks, function bodies, static blocks and at module top level, never at script top level or directly in a `case`; `await using` only in async code and never in a static block. `for (using x of y)` and `for (await using x of y)` heads are allowed anywhere, along with look-alikes that are expressions (`using[x]`, `using` then a line break). Tree-sitter cannot parse `for (using x = e;;)`, so that form is not generated.
+
+Class bodies use an explicit layout (private members first or last, interleaved, or shuffled) and often lead with a computed field keyed by a function literal, the only keys V8 reindexes. Classes have one to six members, field initializers are functions, arrows or classes a quarter of the time, inner classes redeclare an outer `#name` about a third of the time, computed keys may use the class's own private names, heritages may hold an arrow that reads an outer `#name`, and private methods are called from nested arrows, often static ones through the class binding.

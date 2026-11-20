@@ -35,6 +35,8 @@ enum class EditKind {
   kUnwrap,              // replace an expression with one of its operands
   kDeleteRange,         // delete 2-8 consecutive statements
   kDeepen,              // nest an expression in many neutral wrappers
+  kPrivateRename,       // rename a class's private name and its uses
+  kFlipGoal,            // switch between Script and Module (/*M*/ tag)
 };
 
 struct Config {
