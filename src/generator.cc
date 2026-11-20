@@ -174,6 +174,8 @@ void Generator::Reset() {
     used_.insert(name);
     scopes_[0].push_back(name);
   }
+  exported_.clear();
+  exported_.insert(seed_.exports.begin(), seed_.exports.end());
   const unsigned budget =
       static_cast<unsigned>(std::max<size_t>(4, std::min<size_t>(limit_ / 7, 360)));
   nodes_left_ = budget / 4 + random_->Below(budget - budget / 4 + 1);
@@ -443,7 +445,8 @@ std::string Generator::StatementList(const GenContext& context, unsigned depth,
     }
     if (i != 0) out += "\n";
     if (!directive && random_->Chance(5)) {
-      switch (random_->Below(5)) {
+      // HTML-like comments are not allowed in modules.
+      switch (random_->Below(ctx.module ? 3 : 5)) {
         case 0:
           out += "/* c */ ";
           break;
@@ -467,8 +470,10 @@ std::string Generator::StatementList(const GenContext& context, unsigned depth,
 }
 
 std::string Generator::Block(const GenContext& ctx, unsigned depth, unsigned max) {
+  GenContext inner = ctx;
+  inner.block_level = true;
   PushScope();
-  std::string list = StatementList(ctx, depth, max, false, nullptr);
+  std::string list = StatementList(inner, depth, max, false, nullptr);
   PopScope();
   if (list.empty()) return "{}";
   return "{\n" + list + "\n}";
@@ -675,6 +680,7 @@ std::string Generator::ForInOfStatement(const GenContext& ctx, unsigned depth) {
 std::string Generator::SwitchStatement(const GenContext& ctx, unsigned depth) {
   GenContext inner = ctx;
   inner.switch_stmt = true;
+  inner.block_level = false;  // `using` is not allowed directly in a case.
   std::string discriminant = Fit(ExpressionImpl(ctx, depth), kSeq);
   PushScope();
   std::string out = "switch (" + discriminant + ") {";
@@ -765,7 +771,7 @@ std::string Generator::StatementImpl(const GenContext& ctx, unsigned depth,
   enum Kind {
     kExpr, kVar, kIf, kFor, kForInOf, kWhile, kDo, kBlock, kLabel, kFunc,
     kClass, kTry, kSwitch, kReturn, kThrow, kJump, kWith, kDebugger,
-    kEmpty, kAnnexBFunction, kCount
+    kEmpty, kAnnexBFunction, kUsing, kCount
   };
   unsigned weights[kCount] = {};
   weights[kExpr] = 14;
@@ -788,6 +794,7 @@ std::string Generator::StatementImpl(const GenContext& ctx, unsigned depth,
   weights[kDebugger] = 1;
   weights[kEmpty] = 1;
   weights[kAnnexBFunction] = (pos == Pos::kIfBody && !ctx.strict) ? 6 : 0;
+  weights[kUsing] = (list && ctx.block_level) ? 4 : 1;
   unsigned total = 0;
   for (unsigned w : weights) total += w;
   unsigned roll = random_->Below(total);
@@ -869,6 +876,8 @@ std::string Generator::StatementImpl(const GenContext& ctx, unsigned depth,
              SubStatement(ctx, d, Pos::kSub);
     case kDebugger:
       return "debugger;";
+    case kUsing:
+      return UsingStatement(ctx, d, list);
     default:
       return ";";
   }
@@ -884,6 +893,7 @@ std::string Generator::FunctionTail(const GenContext& outer, unsigned depth,
                                     bool prepend_super_call) {
   (void)outer;
   body_ctx.function = true;
+  body_ctx.block_level = true;
   body_ctx.loop = false;
   body_ctx.switch_stmt = false;
   body_ctx.labels.clear();
@@ -940,6 +950,7 @@ std::string Generator::ArrowFunction(const GenContext& ctx, unsigned depth) {
   const bool is_async = random_->Chance(22);
   GenContext body = ctx;
   body.function = true;
+  body.block_level = true;
   body.async = is_async;
   body.generator = false;
   body.loop = false;
@@ -1003,6 +1014,16 @@ std::string Generator::ClassText(const GenContext& ctx, unsigned depth,
       heritage = "null";
     } else if (pick < 55 && VisibleName(&visible, true)) {
       heritage = visible;
+    } else if (pick < 75 && !heritage_ctx.private_names.empty()) {
+      // An arrow in the heritage that reads an outer class's private name:
+      // the heritage sees the outer private scope, never the class's own.
+      const std::string& outer_name = heritage_ctx.private_names[random_->Below(
+          static_cast<uint32_t>(heritage_ctx.private_names.size()))];
+      const std::string param = FreshName("o");
+      std::string read = random_->Chance(50) ? param + "." + outer_name
+                                             : outer_name + " in " + param;
+      heritage = "(" + param + " => " + read + ", " +
+                 (random_->Chance(50) ? std::string("Object") : "class {}") + ")";
     } else {
       heritage = Fit(ExpressionImpl(heritage_ctx, depth), kLHS);
     }
@@ -1023,15 +1044,29 @@ std::string Generator::ClassText(const GenContext& ctx, unsigned depth,
     bool is_static;
   };
   std::vector<PrivateMember> privates;
-  if (random_->Chance(40)) {
+  const bool nested = !ctx.private_names.empty();
+  if (random_->Chance(nested ? 55 : 40)) {
     const unsigned count = 1 + random_->Below(3);
+    std::set<std::string> own;
     for (unsigned i = 0; i < count; ++i) {
-      PrivateMember member{"#" + FreshName("q"), random_->Below(5),
-                           random_->Chance(25)};
+      std::string private_name;
+      // An inner class often redeclares an outer #name, shadowing it.
+      if (nested && random_->Chance(35)) {
+        private_name = ctx.private_names[random_->Below(
+            static_cast<uint32_t>(ctx.private_names.size()))];
+      }
+      if (private_name.empty() || own.count(private_name) != 0) {
+        private_name = "#" + FreshName("q");
+      }
+      own.insert(private_name);
+      PrivateMember member{private_name, random_->Below(5), random_->Chance(25)};
       body.private_names.push_back(member.name);
       privates.push_back(member);
     }
   }
+  // Computed keys see the class's own private names but not `super`.
+  GenContext key_ctx = heritage_ctx;
+  key_ctx.private_names = body.private_names;
 
   GenContext field = body;
   field.function = false;
@@ -1053,29 +1088,41 @@ std::string Generator::ClassText(const GenContext& ctx, unsigned depth,
     m.class_field = false;
     return m;
   };
+  auto plain_key = [&](bool is_static, bool is_field) -> std::string {
+    for (;;) {
+      std::string k = PropertyName();
+      if (k == "constructor") continue;
+      if (is_static && k == "prototype") continue;
+      if (is_field && (k == "get" || k == "set" || k == "static" ||
+                       k == "async" || k == "accessor")) {
+        continue;
+      }
+      return k;
+    }
+  };
+  auto computed_key = [&]() -> std::string {
+    // Function literals in computed keys get reindexed by the parser.
+    if (random_->Chance(30)) return "[" + FunctionLiteral(key_ctx, depth) + "]";
+    return "[" + Fit(ExpressionImpl(key_ctx, depth), kAssign) + "]";
+  };
   auto key = [&](bool is_static, bool is_field) -> std::string {
     const unsigned pick = random_->Below(100);
-    if (pick < 62) {
-      for (;;) {
-        std::string k = PropertyName();
-        if (k == "constructor") continue;
-        if (is_static && k == "prototype") continue;
-        if (is_field && (k == "get" || k == "set" || k == "static" ||
-                         k == "async" || k == "accessor")) {
-          continue;
-        }
-        return k;
-      }
-    }
+    if (pick < 62) return plain_key(is_static, is_field);
     if (pick < 76) return "'k" + std::to_string(random_->Below(4)) + "'";
     if (pick < 86) {
       static constexpr std::string_view kKeys[] = {"0", "1", "1.5", "0x1", "1e3", "2n"};
       return std::string(random_->Pick(kKeys));
     }
-    return "[" + Fit(ExpressionImpl(heritage_ctx, depth), kAssign) + "]";
+    return computed_key();
+  };
+  auto field_value = [&]() -> std::string {
+    if (random_->Chance(25)) return FunctionLiteral(field, depth);
+    return Fit(ExpressionImpl(field, depth), kAssign);
   };
 
-  std::vector<std::string> members;
+  std::vector<std::string> private_members;
+  std::vector<std::string> public_members;
+  std::vector<std::string>* sink = &private_members;
   auto emit_method = [&](const std::string& member_name, bool is_static,
                          unsigned accessor) {
     // accessor: 0 normal method, 1 getter, 2 setter
@@ -1092,15 +1139,15 @@ std::string Generator::ClassText(const GenContext& ctx, unsigned depth,
     if (accessor == 2) head += "set ";
     const unsigned pmin = accessor == 2 ? 1 : 0;
     const unsigned pmax = accessor == 1 ? 0 : accessor == 2 ? 1 : 3;
-    members.push_back(head + member_name +
-                      FunctionTail(outer, depth,
-                                   method_ctx(is_async, is_generator, false),
-                                   pmin, pmax, accessor == 0, {}, false));
+    sink->push_back(head + member_name +
+                    FunctionTail(outer, depth,
+                                 method_ctx(is_async, is_generator, false),
+                                 pmin, pmax, accessor == 0, {}, false));
   };
   auto emit_field = [&](const std::string& member_name, bool is_static) {
     std::string text = (is_static ? "static " : "") + member_name;
-    if (random_->Chance(70)) text += " = " + Fit(ExpressionImpl(field, depth), kAssign);
-    members.push_back(text + ";");
+    if (random_->Chance(70)) text += " = " + field_value();
+    sink->push_back(text + ";");
   };
 
   for (const PrivateMember& member : privates) {
@@ -1124,8 +1171,27 @@ std::string Generator::ClassText(const GenContext& ctx, unsigned depth,
     }
   }
 
+  sink = &public_members;
+  // Private methods called from nested arrows, often static ones through the
+  // class binding.
+  for (const PrivateMember& member : privates) {
+    if (member.kind != 1 || !random_->Chance(45)) continue;
+    const bool by_name = member.is_static && !name.empty() && !IsContextual(name) &&
+                         random_->Chance(60);
+    const std::string receiver = by_name ? name : "this";
+    const std::string call = "() => " + receiver + "." + member.name + "()";
+    const bool is_static = member.is_static || random_->Chance(30);
+    if (random_->Chance(50)) {
+      sink->push_back(std::string(is_static ? "static " : "") +
+                      plain_key(is_static, false) + "() { return " + call + "; }");
+    } else {
+      sink->push_back(std::string(is_static ? "static " : "") +
+                      plain_key(is_static, true) + " = " + call + ";");
+    }
+  }
+
   bool constructor_emitted = false;
-  const unsigned count = random_->Below(4);
+  const unsigned count = 1 + random_->Below(6);
   for (unsigned i = 0; i < count; ++i) {
     if (!Spend()) break;
     const unsigned pick = random_->Below(100);
@@ -1139,20 +1205,59 @@ std::string Generator::ClassText(const GenContext& ctx, unsigned depth,
     } else if (pick < 74) {
       emit_method(key(is_static, false), is_static, 2);
     } else if (pick < 88) {
-      members.push_back("static " + Block(field, depth, 3));
+      sink->push_back("static " + Block(field, depth, 3));
     } else if (!constructor_emitted) {
       constructor_emitted = true;
       const std::string ctor_name = random_->Chance(20) ? "'constructor'" : "constructor";
-      members.push_back(ctor_name +
-                        FunctionTail(outer, depth, method_ctx(false, false, derived),
-                                     0, 3, true, {}, derived && random_->Chance(60)));
+      sink->push_back(ctor_name +
+                      FunctionTail(outer, depth, method_ctx(false, false, derived),
+                                   0, 3, true, {}, derived && random_->Chance(60)));
     } else {
-      members.push_back(";");
+      sink->push_back(";");
     }
   }
-  // Shuffle members so private declarations are not always first.
-  for (size_t n = members.size(); n > 1; --n) {
-    std::swap(members[n - 1], members[random_->Below(static_cast<uint32_t>(n))]);
+
+  // An explicit layout instead of a shuffle: the order of private and public
+  // elements, and a leading computed field, steer the parser's class paths.
+  std::vector<std::string> members;
+  auto interleave = [&](const std::vector<std::string>& a,
+                        const std::vector<std::string>& b) {
+    for (size_t i = 0; i < a.size() || i < b.size(); ++i) {
+      if (i < a.size()) members.push_back(a[i]);
+      if (i < b.size()) members.push_back(b[i]);
+    }
+  };
+  switch (random_->Below(5)) {
+    case 0:
+      members = private_members;
+      members.insert(members.end(), public_members.begin(), public_members.end());
+      break;
+    case 1:
+      members = public_members;
+      members.insert(members.end(), private_members.begin(), private_members.end());
+      break;
+    case 2:
+      interleave(public_members, private_members);
+      break;
+    case 3:
+      interleave(private_members, public_members);
+      break;
+    default:
+      interleave(private_members, public_members);
+      for (size_t n = members.size(); n > 1; --n) {
+        std::swap(members[n - 1], members[random_->Below(static_cast<uint32_t>(n))]);
+      }
+      break;
+  }
+  // Only computed field keys are reindexed, so a function literal in the
+  // first one is the interesting case.
+  if (random_->Chance(45)) {
+    const bool is_static = random_->Chance(40);
+    std::string lead = is_static ? "static " : "";
+    lead += random_->Chance(65) ? "[" + FunctionLiteral(key_ctx, depth) + "]"
+                                : "[" + Fit(ExpressionImpl(key_ctx, depth), kAssign) + "]";
+    if (random_->Chance(85)) lead += " = " + field_value();
+    members.insert(members.begin(), lead + ";");
   }
   PopScope();
 
@@ -1161,6 +1266,15 @@ std::string Generator::ClassText(const GenContext& ctx, unsigned depth,
   if (derived) text += " extends " + heritage;
   if (members.empty()) return text + " {}";
   return text + " {\n" + Join(members, "\n") + "\n}";
+}
+
+std::string Generator::FunctionLiteral(const GenContext& ctx, unsigned depth) {
+  const unsigned d = depth > 0 ? depth - 1 : 0;
+  std::string ignored;
+  const unsigned pick = random_->Below(100);
+  if (pick < 50) return ArrowFunction(ctx, d);
+  if (pick < 80) return FunctionExpressionOrDeclaration(ctx, d, false, &ignored);
+  return ClassText(ctx, d, false, &ignored);
 }
 
 std::string Generator::ObjectLiteral(const GenContext& ctx, unsigned depth) {
@@ -1246,9 +1360,12 @@ Expr Generator::Atom(const GenContext& ctx) {
             kPrimary, 0};
   }
   if (pick < 39 && !seed_.blocks.empty()) {
-    return {"(" + seed_.blocks[random_->Below(
-                      static_cast<uint32_t>(seed_.blocks.size()))] + ")",
-            kPrimary, 0};
+    const std::string& block =
+        seed_.blocks[random_->Below(static_cast<uint32_t>(seed_.blocks.size()))];
+    // `arguments` is an early error anywhere under a class field.
+    if (!ctx.class_field || block.find("arguments") == std::string::npos) {
+      return {"(" + block + ")", kPrimary, 0};
+    }
   }
   if (pick < 54) return {NumberLiteral(ctx.strict), kPrimary, kNumber};
   if (pick < 64) return {StringLiteral(ctx.strict), kPrimary, 0};
@@ -1264,6 +1381,10 @@ Expr Generator::Atom(const GenContext& ctx) {
   if (pick < 92 && ctx.super_property) {
     if (random_->Chance(50)) return {"super." + PropertyName(), kLHS, 0};
     return {"super[" + StringLiteral(true) + "]", kLHS, 0};
+  }
+  if (ctx.module && random_->Chance(10)) {
+    // kCall keeps `new import.meta` parenthesized.
+    return {random_->Chance(50) ? "import.meta" : "import.meta.url", kLHS, kCall};
   }
   return {std::string(random_->Pick(kGlobals)), kPrimary, 0};
 }
@@ -1428,7 +1549,9 @@ Expr Generator::Call(const GenContext& ctx, unsigned depth) {
   Expr callee = ExpressionImpl(ctx, depth);
   if (pick < 26) {
     // Tagged templates may not be part of an optional chain.
-    return {Fit(callee, kLHS, kOptional) + TemplateLiteral(ctx, depth, true), kLHS, 0};
+    std::string tag = Fit(callee, kLHS, kOptional);
+    const unsigned call = tag == callee.text ? (callee.flags & kCall) : 0;
+    return {tag + TemplateLiteral(ctx, depth, true), kLHS, call};
   }
   if (pick < 40) {
     std::string text = "new " + Fit(callee, kLHS, kOptional | kCall);
@@ -1449,7 +1572,9 @@ Expr Generator::Member(const GenContext& ctx, unsigned depth) {
   Expr object = ExpressionImpl(ctx, depth);
   std::string base = Fit(object, kLHS, kNumber);
   const bool kept_chain = base == object.text;
-  unsigned flags = kept_chain ? (object.flags & kOptional) : 0;
+  // A call stays visible to `new` through member accesses: `new f()[x]` and
+  // `new import(x).y` are not what they look like.
+  unsigned flags = kept_chain ? (object.flags & (kOptional | kCall)) : 0;
   const bool optional = random_->Chance(18);
   if (optional) flags |= kOptional;
   const std::string dot = optional ? "?." : ".";
@@ -1613,6 +1738,310 @@ bool Generator::Expression(std::string* out, const GenContext& context,
     Expr e = ExpressionImpl(context, depth > attempt ? depth - attempt : 0);
     std::string text = "(" + e.text + ")";
     if (text.size() <= limit_) {
+      *out = std::move(text);
+      return true;
+    }
+  }
+  out->clear();
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// `using` declarations.
+
+std::string Generator::UsingStatement(const GenContext& ctx, unsigned depth,
+                                      bool list) {
+  auto initializer = [&]() -> std::string {
+    const unsigned pick = random_->Below(100);
+    if (pick < 25) return "null";
+    if (pick < 32) return "undefined";
+    if (pick < 45) return "{ [Symbol.dispose]() {} }";
+    if (pick < 52) return "{ async [Symbol.asyncDispose]() {} }";
+    return Fit(ExpressionImpl(ctx, depth), kAssign);
+  };
+  const unsigned pick = random_->Below(100);
+  // A declaration: only directly in a block, function body, static block, or
+  // at the top level of a module; never directly in a switch case.
+  if (list && ctx.block_level && pick < 55) {
+    const bool await_using = ctx.async && random_->Chance(35);
+    const unsigned count = 1 + (random_->Chance(25) ? random_->Below(2) + 1 : 0);
+    std::vector<std::string> parts;
+    std::vector<std::string> names;
+    for (unsigned i = 0; i < count; ++i) {
+      avoid_contextual_ = true;
+      std::string name = FreshName("u");
+      avoid_contextual_ = false;
+      parts.push_back(name + " = " + initializer());
+      names.push_back(name);
+    }
+    for (const std::string& name : names) Declare(name);
+    return std::string(await_using ? "await using " : "using ") + Join(parts, ", ") + ";";
+  }
+  // A for-of head opens its own scope, so it is legal in any statement
+  // position.
+  if (pick < 80) {
+    GenContext loop = ctx;
+    loop.loop = true;
+    PushScope();
+    const bool await_using = ctx.async && random_->Chance(35);
+    const bool for_await = ctx.async && random_->Chance(25);
+    avoid_contextual_ = true;
+    const std::string name = FreshName("u");
+    avoid_contextual_ = false;
+    const std::string right = Fit(ExpressionImpl(ctx, depth), kAssign);
+    Declare(name);
+    const std::string body = SubStatement(loop, depth, Pos::kSub);
+    PopScope();
+    return std::string("for ") + (for_await ? "await " : "") + "(" +
+           (await_using ? "await using " : "using ") + name + " of " + right + ") " + body;
+  }
+  // Look-alikes that are not declarations.
+  std::string name;
+  if (!VisibleName(&name, false) || IsContextual(name)) {
+    avoid_contextual_ = true;
+    name = FreshName("u");
+    avoid_contextual_ = false;
+  }
+  switch (random_->Below(list ? 3 : 2)) {
+    case 0:
+      return "using[" + name + "];";
+    case 1:
+      return "using[" + name + "] = " + Fit(ExpressionImpl(ctx, depth), kAssign) + ";";
+    default:
+      // `using` then a line break is an identifier and its own statement.
+      return "using\n" + name + ";";
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Modules.
+
+std::string Generator::ModuleSpecifier() {
+  // Specifiers that d8 can load, so whole programs can be checked as modules.
+  static constexpr std::string_view kSpecifiers[] = {
+      "\"/dev/null\"", "'/dev/null'", "\"data:text/javascript,\"",
+      "\"data:text/javascript,export default 0\""};
+  std::string out(random_->Pick(kSpecifiers));
+  if (random_->Chance(25)) {
+    // Import attributes with unique keys; `type` would make d8 load JSON.
+    static constexpr std::string_view kKeys[] = {"mode", "x", "integrity", "\"x-y\"",
+                                                 "'z'", "kind"};
+    std::vector<std::string> keys;
+    const unsigned count = random_->Below(3);
+    for (unsigned i = 0; i < count; ++i) {
+      std::string k(random_->Pick(kKeys));
+      if (std::find(keys.begin(), keys.end(), k) == keys.end()) keys.push_back(k);
+    }
+    std::vector<std::string> parts;
+    for (const std::string& k : keys) parts.push_back(k + ": " + StringLiteral(true));
+    out += " with {" + Join(parts, ", ") + "}";
+  }
+  return out;
+}
+
+std::string Generator::ExportName() {
+  if (exported_.count("default") == 0 && random_->Chance(10)) {
+    exported_.insert("default");
+    return "default";
+  }
+  avoid_contextual_ = true;
+  std::string name = FreshName("x");
+  avoid_contextual_ = false;
+  if (random_->Chance(30)) {
+    // A string export name; its value is what must stay unique.
+    name += " n";
+    exported_.insert(name);
+    return "\"" + name + "\"";
+  }
+  exported_.insert(name);
+  return name;
+}
+
+std::string Generator::ModuleItemImpl(const GenContext& ctx, unsigned depth) {
+  const unsigned d = depth > 0 ? depth - 1 : 0;
+  const unsigned pick = random_->Below(100);
+  if (pick < 30) {
+    const std::string spec = ModuleSpecifier();
+    std::vector<std::string> locals;
+    auto local = [&]() {
+      avoid_contextual_ = true;
+      std::string name = FreshName("m");
+      avoid_contextual_ = false;
+      locals.push_back(name);
+      return name;
+    };
+    auto named = [&]() {
+      std::vector<std::string> parts;
+      const unsigned count = random_->Below(4);
+      for (unsigned i = 0; i < count; ++i) {
+        const std::string name = local();
+        switch (random_->Below(4)) {
+          case 0:
+            parts.push_back(name);
+            break;
+          case 1:
+            parts.push_back("default as " + name);
+            break;
+          case 2:
+            parts.push_back("\"" + name + " s\" as " + name);
+            break;
+          default:
+            parts.push_back("i" + name + " as " + name);
+            break;
+        }
+      }
+      return "{" + Join(parts, ", ") + "}";
+    };
+    std::string clause;
+    switch (random_->Below(7)) {
+      case 0:
+        break;
+      case 1:
+        clause = local();
+        break;
+      case 2:
+        clause = "* as " + local();
+        break;
+      case 3:
+        clause = local();
+        clause += ", * as " + local();
+        break;
+      case 4:
+        clause = named();
+        break;
+      case 5:
+        clause = local();
+        clause += ", " + named();
+        break;
+      default:
+        clause = "{}";
+        break;
+    }
+    for (const std::string& name : locals) Declare(name);
+    if (clause.empty()) return "import " + spec + ";";
+    return "import " + clause + " from " + spec + ";";
+  }
+  const unsigned kind = random_->Below(100);
+  if (kind < 22) {
+    const size_t before = scopes_.back().size();
+    std::string decl = VariableDeclaration(ctx, d, false, false);
+    for (size_t i = before; i < scopes_.back().size(); ++i) {
+      exported_.insert(scopes_.back()[i]);
+    }
+    return "export " + decl + ";";
+  }
+  if (kind < 36) {
+    std::string name;
+    std::string text = random_->Chance(55)
+                           ? FunctionExpressionOrDeclaration(ctx, d, true, &name)
+                           : ClassText(ctx, d, true, &name);
+    exported_.insert(name);
+    return "export " + text;
+  }
+  if (kind < 50 && exported_.count("default") == 0) {
+    exported_.insert("default");
+    std::string ignored;
+    switch (random_->Below(4)) {
+      case 0: {
+        std::string text = Fit(ExpressionImpl(ctx, d), kAssign);
+        if (NeedsStatementParens(text)) text = "(" + text + ")";
+        return "export default " + text + ";";
+      }
+      case 1:
+        // A named or anonymous hoistable declaration.
+        return "export default " + FunctionExpressionOrDeclaration(ctx, d, false, &ignored);
+      case 2:
+        return "export default " + ClassText(ctx, d, false, &ignored);
+      default:
+        return "export default " + ArrowFunction(ctx, d) + ";";
+    }
+  }
+  if (kind < 75) {
+    // Local exports: only names declared at the top level resolve.
+    std::vector<std::string> candidates;
+    for (const std::string& name : scopes_[0]) {
+      if (!name.empty() && name[0] != '\\' && !IsContextual(name)) candidates.push_back(name);
+    }
+    if (!candidates.empty()) {
+      std::vector<std::string> parts;
+      const unsigned count = 1 + random_->Below(3);
+      for (unsigned i = 0; i < count; ++i) {
+        const std::string& name =
+            candidates[random_->Below(static_cast<uint32_t>(candidates.size()))];
+        if (exported_.count(name) == 0 && random_->Chance(60)) {
+          exported_.insert(name);
+          parts.push_back(name);
+        } else {
+          parts.push_back(name + " as " + ExportName());
+        }
+      }
+      return "export {" + Join(parts, ", ") + "};";
+    }
+  }
+  // Re-exports.
+  const std::string spec = ModuleSpecifier();
+  switch (random_->Below(3)) {
+    case 0:
+      return "export * from " + spec + ";";
+    case 1:
+      return "export * as " + ExportName() + " from " + spec + ";";
+    default: {
+      std::vector<std::string> parts;
+      const unsigned count = random_->Below(3);
+      for (unsigned i = 0; i < count; ++i) {
+        switch (random_->Below(3)) {
+          case 0:
+            parts.push_back("default as " + ExportName());
+            break;
+          case 1:
+            parts.push_back("\"r s\" as " + ExportName());
+            break;
+          default:
+            parts.push_back("r" + std::to_string(i) + " as " + ExportName());
+            break;
+        }
+      }
+      return "export {" + Join(parts, ", ") + "} from " + spec + ";";
+    }
+  }
+}
+
+bool Generator::ModuleProgram(std::string* out, unsigned depth,
+                              unsigned max_statements) {
+  for (unsigned attempt = 0; attempt < 4; ++attempt) {
+    Reset();
+    if (attempt != 0) nodes_left_ >>= attempt;
+    GenContext ctx;
+    ctx.module = true;
+    ctx.strict = true;
+    ctx.async = true;  // top-level await
+    ctx.block_level = true;
+    const unsigned d = depth > attempt ? depth - attempt : 1;
+    std::vector<std::string> items;
+    const unsigned count = 1 + random_->Below(std::max(1u, max_statements) + 1);
+    for (unsigned i = 0; i < count; ++i) {
+      if (!Spend()) break;
+      items.push_back(random_->Chance(40) ? ModuleItemImpl(ctx, d)
+                                          : StatementImpl(ctx, d, Pos::kList));
+    }
+    if (items.empty()) items.push_back("export {};");
+    std::string text = std::string(kModuleTag) + "\n" + Join(items, "\n");
+    if (text.size() <= limit_) {
+      *out = std::move(text);
+      return true;
+    }
+  }
+  out->clear();
+  return false;
+}
+
+bool Generator::ModuleItem(std::string* out, const GenContext& context,
+                           unsigned depth) {
+  for (unsigned attempt = 0; attempt < 4; ++attempt) {
+    Reset();
+    if (attempt != 0) nodes_left_ >>= attempt;
+    std::string text = ModuleItemImpl(context, depth > attempt ? depth - attempt : 1);
+    if (!text.empty() && text.size() <= limit_) {
       *out = std::move(text);
       return true;
     }

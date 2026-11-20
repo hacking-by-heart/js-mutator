@@ -26,6 +26,8 @@ enum class EditKind {
   kGenerateProgram,     // replace the parent with a generated program
   kDisruptSyntax,       // malformed mode: token-level corruption
   kInjectEarlyError,    // malformed mode: an early (parse-time) error
+  kPrivateRename,       // rename a class's private name and its uses
+  kFlipGoal,            // switch between Script and Module (/*M*/ tag)
 };
 
 struct Config {

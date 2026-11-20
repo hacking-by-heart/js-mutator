@@ -128,6 +128,7 @@ TSNode Field(TSNode node, const char* name) {
 }
 
 std::string_view NodeText(TSNode node, std::string_view source) {
+  if (ts_node_is_null(node)) return {};
   const size_t start = ts_node_start_byte(node);
   const size_t end = ts_node_end_byte(node);
   if (start > end || end > source.size()) return {};
@@ -170,6 +171,9 @@ bool IsLoopType(const char* type) {
 
 bool IsDeclarationType(const char* type) {
   return std::strcmp(type, "lexical_declaration") == 0 ||
+         std::strcmp(type, "using_declaration") == 0 ||
+         std::strcmp(type, "import_statement") == 0 ||
+         std::strcmp(type, "export_statement") == 0 ||
          std::strcmp(type, "class_declaration") == 0 ||
          std::strcmp(type, "function_declaration") == 0 ||
          std::strcmp(type, "generator_function_declaration") == 0;
@@ -263,11 +267,42 @@ std::string MemberName(TSNode member, std::string_view source) {
   return ts_node_is_null(name) ? std::string() : std::string(NodeText(name, source));
 }
 
+bool IsModuleSource(std::string_view source) {
+  return source.substr(0, internal::kModuleTag.size()) == internal::kModuleTag;
+}
+
+bool HasLineBreak(std::string_view source, size_t start, size_t end) {
+  if (start >= end || end > source.size()) return false;
+  return source.substr(start, end - start).find_first_of("\n\r") != std::string_view::npos;
+}
+
+TSNode DirectToken(TSNode node, const char* token) {
+  const uint32_t count = ts_node_child_count(node);
+  for (uint32_t i = 0; i < count; ++i) {
+    TSNode child = ts_node_child(node, i);
+    if (std::strcmp(ts_node_type(child), token) == 0) return child;
+  }
+  return TSNode{};
+}
+
+// Tree-sitter reads `using[x]` and `using <newline> x` as using
+// declarations; JavaScript reads them as expressions.
+bool IsRealUsing(TSNode node, std::string_view source) {
+  if (!Is(node, "using_declaration")) return false;
+  TSNode keyword = DirectToken(node, "using");
+  TSNode first = ts_node_named_child(node, 0);
+  if (ts_node_is_null(keyword) || !Is(first, "variable_declarator")) return false;
+  if (Is(Field(first, "name"), "array_pattern")) return false;
+  return !HasLineBreak(source, ts_node_end_byte(keyword), ts_node_start_byte(first));
+}
+
 // The syntactic context of `node`: what return, await, yield, break,
 // continue, super, new.target, arguments, private names, and strictness mean
 // at that position.
 GenContext ContextFor(TSNode node, std::string_view source) {
   GenContext c;
+  const bool module = IsModuleSource(source);
+  c.block_level = Is(node, "statement_block") || (module && Is(node, "program"));
   bool barrier = false;   // crossed a function or class-element boundary
   bool fn_set = false;    // return/await/yield decided
   bool settled = false;   // super/new.target/arguments decided
@@ -346,6 +381,11 @@ GenContext ContextFor(TSNode node, std::string_view source) {
       }
     }
   }
+  if (module) {
+    c.module = true;
+    c.strict = true;
+    if (!fn_set) c.async = true;  // top-level await
+  }
   return c;
 }
 
@@ -390,6 +430,55 @@ void CollectBindingNames(TSNode node, std::string_view source,
   }
 }
 
+std::vector<TSNode> ImportBindings(TSNode statement) {
+  std::vector<TSNode> out;
+  TSNode clause = ts_node_named_child(statement, 0);
+  if (!Is(clause, "import_clause")) return out;
+  const uint32_t count = ts_node_named_child_count(clause);
+  for (uint32_t i = 0; i < count; ++i) {
+    TSNode child = ts_node_named_child(clause, i);
+    if (Is(child, "identifier")) {
+      out.push_back(child);
+    } else if (Is(child, "namespace_import")) {
+      TSNode name = ts_node_named_child(child, 0);
+      if (Is(name, "identifier")) out.push_back(name);
+    } else if (Is(child, "named_imports")) {
+      const uint32_t specs = ts_node_named_child_count(child);
+      for (uint32_t j = 0; j < specs; ++j) {
+        TSNode spec = ts_node_named_child(child, j);
+        if (!Is(spec, "import_specifier")) continue;
+        TSNode alias = Field(spec, "alias");
+        TSNode name = ts_node_is_null(alias) ? Field(spec, "name") : alias;
+        if (Is(name, "identifier")) out.push_back(name);
+      }
+    }
+  }
+  return out;
+}
+
+void DeclaredNames(TSNode statement, std::string_view source,
+                   std::vector<std::string>* names, Budget* budget);
+
+// Names declared by `using`, import, and export declarations.
+void DeclaredModuleNames(TSNode statement, std::string_view source,
+                         std::vector<std::string>* names, Budget* budget) {
+  if (Is(statement, "using_declaration")) {
+    if (!IsRealUsing(statement, source)) return;
+    const uint32_t count = ts_node_named_child_count(statement);
+    for (uint32_t i = 0; i < count; ++i) {
+      TSNode declarator = ts_node_named_child(statement, i);
+      if (Is(declarator, "variable_declarator")) {
+        CollectBindingNames(Field(declarator, "name"), source, names, budget);
+      }
+    }
+  } else if (Is(statement, "import_statement")) {
+    for (TSNode name : ImportBindings(statement)) AddName(names, NodeText(name, source));
+  } else if (Is(statement, "export_statement")) {
+    TSNode declaration = Field(statement, "declaration");
+    if (!ts_node_is_null(declaration)) DeclaredNames(declaration, source, names, budget);
+  }
+}
+
 // Names declared directly by a statement in its own list.
 void DeclaredNames(TSNode statement, std::string_view source,
                    std::vector<std::string>* names, Budget* budget) {
@@ -408,6 +497,8 @@ void DeclaredNames(TSNode statement, std::string_view source,
              std::strcmp(type, "class_declaration") == 0) {
     TSNode name = Field(statement, "name");
     if (!ts_node_is_null(name)) AddName(names, NodeText(name, source));
+  } else {
+    DeclaredModuleNames(statement, source, names, budget);
   }
 }
 
@@ -573,7 +664,9 @@ Dependencies FindDependencies(TSNode root, std::string_view source,
   Walk(root, budget, [&](TSNode node, TSNode parent) {
     const char* type = ts_node_type(node);
     if (std::strcmp(type, "await_expression") == 0) d.await_ = true;
-    if (std::strcmp(type, "for_in_statement") == 0 && HasDirectToken(node, "await")) {
+    if ((std::strcmp(type, "for_in_statement") == 0 ||
+         std::strcmp(type, "using_declaration") == 0) &&
+        HasDirectToken(node, "await")) {
       d.await_ = true;
     }
     if (std::strcmp(type, "yield_expression") == 0) d.yield_ = true;
@@ -725,6 +818,8 @@ class EarlyErrors {
 
   bool Check(TSNode root) {
     State state;
+    module_ = IsModuleSource(source_);
+    if (module_) CheckModule(root);
     Visit(root, state, 0);
     return error_;
   }
@@ -752,6 +847,7 @@ class EarlyErrors {
                             std::strcmp(type, "generator_function_declaration") == 0;
       if (std::strcmp(type, "lexical_declaration") == 0 ||
           std::strcmp(type, "class_declaration") == 0 ||
+          IsRealUsing(statement, source_) ||
           (function && (!function_level))) {
         CollectRaw(statement, &names);
         for (const std::string& name : names) {
@@ -782,7 +878,8 @@ class EarlyErrors {
   void CollectRaw(TSNode statement, std::vector<std::string>* names) {
     const char* type = ts_node_type(statement);
     if (std::strcmp(type, "lexical_declaration") == 0 ||
-        std::strcmp(type, "variable_declaration") == 0) {
+        std::strcmp(type, "variable_declaration") == 0 ||
+        std::strcmp(type, "using_declaration") == 0) {
       const uint32_t count = ts_node_named_child_count(statement);
       for (uint32_t i = 0; i < count; ++i) {
         TSNode declarator = ts_node_named_child(statement, i);
@@ -868,6 +965,8 @@ class EarlyErrors {
     }
     ++budget_->node_visits;
     const char* type = ts_node_type(node);
+    CheckGoalAndUsing(node, type);
+    if (error_) return;
 
     if (std::strcmp(type, "break_statement") == 0) {
       TSNode label = Field(node, "label");
@@ -996,9 +1095,214 @@ class EarlyErrors {
     }
   }
 
+  // `using` declarations, `await` placement, and what each goal allows.
+  void CheckGoalAndUsing(TSNode node, const char* type) {
+    if (std::strcmp(type, "using_declaration") == 0) {
+      TSNode await_token = DirectToken(node, "await");
+      if (!IsRealUsing(node, source_)) {
+        // `await using[x]` is an await expression, rarely a valid one.
+        if (!ts_node_is_null(await_token)) error_ = true;
+        return;
+      }
+      TSNode parent = ts_node_parent(node);
+      if (!Is(parent, "statement_block") && !(module_ && Is(parent, "program"))) {
+        error_ = true;  // script top level, switch case, or statement position
+      }
+      const uint32_t count = ts_node_named_child_count(node);
+      for (uint32_t i = 0; i < count; ++i) {
+        TSNode declarator = ts_node_named_child(node, i);
+        if (!Is(declarator, "variable_declarator")) continue;
+        TSNode name = Field(declarator, "name");
+        if (!Is(name, "identifier") || Text(name) == "let" ||
+            ts_node_is_null(Field(declarator, "value"))) {
+          error_ = true;
+        }
+      }
+      if (!ts_node_is_null(await_token) &&
+          (HasLineBreak(source_, ts_node_end_byte(await_token),
+                        ts_node_start_byte(DirectToken(node, "using"))) ||
+           !ContextFor(node, source_).async)) {
+        error_ = true;
+      }
+      return;
+    }
+    if (std::strcmp(type, "for_in_statement") == 0) {
+      TSNode open = DirectToken(node, "(");
+      TSNode await_token = DirectToken(node, "await");
+      const bool head_await = !ts_node_is_null(await_token) && !ts_node_is_null(open) &&
+                              ts_node_start_byte(await_token) > ts_node_start_byte(open);
+      if (!ts_node_is_null(await_token) && !ContextFor(node, source_).async) error_ = true;
+      if (!ts_node_is_null(DirectToken(node, "using"))) {
+        TSNode left = Field(node, "left");
+        TSNode op = Field(node, "operator");
+        if (ts_node_is_null(op) || NodeText(op, source_) != "of" || !Is(left, "identifier") ||
+            Text(left) == "let" || Text(left) == "of") {
+          error_ = true;
+        }
+      } else if (head_await) {
+        error_ = true;
+      }
+      return;
+    }
+    if (std::strcmp(type, "await_expression") == 0) {
+      // Outside async code a script reads `await (x)`, `await [x]`, or
+      // `await + x` as uses of an identifier named await.
+      if (!ContextFor(node, source_).async) {
+        const std::string_view rest =
+            NodeText(node, source_).substr(5);
+        const size_t next = rest.find_first_not_of(" \t\r\n");
+        const bool operand_like = next == std::string_view::npos ||
+                                  std::strchr("([+-/`", rest[next]) == nullptr;
+        if (module_ || operand_like) error_ = true;
+      }
+      return;
+    }
+    if (std::strcmp(type, "import_statement") == 0 ||
+        std::strcmp(type, "export_statement") == 0) {
+      if (!module_ || !Is(ts_node_parent(node), "program")) error_ = true;
+      return;
+    }
+    if (std::strcmp(type, "meta_property") == 0) {
+      if (!module_ && NodeText(node, source_).substr(0, 6) == "import") error_ = true;
+      return;
+    }
+    if (std::strcmp(type, "import_attribute") == 0) {
+      std::set<std::string> keys;
+      TSNode object = ts_node_named_child(node, 0);
+      const uint32_t count = ts_node_named_child_count(object);
+      for (uint32_t i = 0; i < count; ++i) {
+        TSNode pair = ts_node_named_child(object, i);
+        if (!Is(pair, "pair")) continue;
+        TSNode key = Field(pair, "key");
+        // Keys are names or strings, values are strings, and keys are unique.
+        if ((!Is(key, "property_identifier") && !Is(key, "string")) ||
+            !Is(Field(pair, "value"), "string") || !keys.insert(NameValue(key)).second) {
+          error_ = true;
+        }
+      }
+      return;
+    }
+    if (!module_) return;
+    if (std::strcmp(type, "html_comment") == 0) error_ = true;
+    if (std::strcmp(type, "identifier") == 0 && Text(node) == "await") error_ = true;
+  }
+
+  // The value of a module export name or property key: strings lose quotes.
+  std::string NameValue(TSNode node) {
+    std::string text = Text(node);
+    if (Is(node, "string") && text.size() >= 2) return text.substr(1, text.size() - 2);
+    return text;
+  }
+
+  // Module top level: imports and top-level functions are lexical, exported
+  // names are unique, and local exports must resolve.
+  void CheckModule(TSNode root) {
+    if (HasSloppyOnly(root, source_, budget_)) error_ = true;
+    std::set<std::string> lexical;
+    std::set<std::string> exports;
+    std::vector<std::string> locals;
+    auto lexical_name = [&](const std::string& name) {
+      if (!lexical.insert(name).second) error_ = true;
+    };
+    auto export_name = [&](const std::string& name) {
+      if (!exports.insert(name).second) error_ = true;
+    };
+    for (TSNode statement : ListStatements(root)) {
+      TSNode s = statement;
+      if (Is(s, "import_statement")) {
+        for (TSNode name : ImportBindings(s)) lexical_name(Text(name));
+        continue;
+      }
+      if (Is(s, "export_statement")) {
+        const bool is_default = HasDirectToken(s, "default");
+        if (is_default) export_name("default");
+        TSNode declaration = Field(s, "declaration");
+        if (ts_node_is_null(declaration)) {
+          const uint32_t count = ts_node_named_child_count(s);
+          const bool from = !ts_node_is_null(Field(s, "source"));
+          for (uint32_t i = 0; i < count; ++i) {
+            TSNode child = ts_node_named_child(s, i);
+            if (Is(child, "namespace_export")) {
+              export_name(NameValue(ts_node_named_child(child, 0)));
+            } else if (Is(child, "export_clause")) {
+              const uint32_t specs = ts_node_named_child_count(child);
+              for (uint32_t j = 0; j < specs; ++j) {
+                TSNode spec = ts_node_named_child(child, j);
+                if (!Is(spec, "export_specifier")) continue;
+                TSNode name = Field(spec, "name");
+                TSNode alias = Field(spec, "alias");
+                export_name(NameValue(ts_node_is_null(alias) ? name : alias));
+                if (!from) {
+                  if (!Is(name, "identifier")) error_ = true;
+                  locals.push_back(Text(name));
+                }
+              }
+            }
+          }
+          continue;
+        }
+        s = declaration;
+        if (!is_default) {
+          std::vector<std::string> names;
+          CollectRaw(s, &names);
+          for (const std::string& name : names) export_name(name);
+        }
+      }
+      const char* type = ts_node_type(s);
+      if (std::strcmp(type, "lexical_declaration") == 0 ||
+          std::strcmp(type, "class_declaration") == 0 ||
+          std::strcmp(type, "function_declaration") == 0 ||
+          std::strcmp(type, "generator_function_declaration") == 0 ||
+          IsRealUsing(s, source_)) {
+        std::vector<std::string> names;
+        CollectRaw(s, &names);
+        for (const std::string& name : names) lexical_name(name);
+      }
+    }
+    // var names hoist from nested blocks, but not out of functions or classes.
+    std::set<std::string> vars;
+    CollectVarNames(root, &vars, 0);
+    for (const std::string& name : vars) {
+      if (lexical.count(name) != 0) error_ = true;
+    }
+    for (const std::string& name : locals) {
+      if (lexical.count(name) == 0 && vars.count(name) == 0) error_ = true;
+    }
+  }
+
+  void CollectVarNames(TSNode node, std::set<std::string>* vars, unsigned depth) {
+    if (ts_node_is_null(node) || depth > kMaxCheckDepth || budget_->exhausted) return;
+    if (budget_->node_visits >= kMaxNodeVisits) {
+      budget_->exhausted = true;
+      return;
+    }
+    ++budget_->node_visits;
+    const char* type = ts_node_type(node);
+    if (depth > 0 && (IsFunctionType(type) || std::strcmp(type, "class_body") == 0 ||
+                      std::strcmp(type, "class_heritage") == 0)) {
+      return;
+    }
+    if (std::strcmp(type, "variable_declaration") == 0) {
+      std::vector<std::string> names;
+      CollectRaw(node, &names);
+      vars->insert(names.begin(), names.end());
+    } else if (std::strcmp(type, "for_in_statement") == 0 &&
+               !ts_node_is_null(Field(node, "kind")) &&
+               NodeText(Field(node, "kind"), source_) == "var") {
+      std::vector<std::string> names;
+      CollectPattern(Field(node, "left"), &names, 0);
+      vars->insert(names.begin(), names.end());
+    }
+    const uint32_t count = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < count; ++i) {
+      CollectVarNames(ts_node_named_child(node, i), vars, depth + 1);
+    }
+  }
+
   std::string_view source_;
   Budget* budget_;
   bool error_ = false;
+  bool module_ = false;
   std::set<std::string> plain_functions_;
   std::set<std::string> outer_lexical_params_;
 };
@@ -1210,7 +1514,7 @@ std::optional<std::string> EditLiteral(Mutation& m) {
     const bool member_name = Is(parent, "method_definition") ||
                              Is(parent, "field_definition");
     if (literal && !member_name && !ts_node_has_error(node) &&
-        !Is(parent, "import_statement")) {
+        !Is(parent, "import_statement") && !Is(parent, "export_statement")) {
       literals.push_back(node);
     }
     return literals.size() < 512;
@@ -1326,7 +1630,12 @@ std::optional<std::string> EditOperator(Mutation& m) {
   return Replace(m.source, start, end, text, m.limit);
 }
 
+std::optional<std::string> EditGenerateModuleItem(Mutation& m);
+
 std::optional<std::string> EditGenerateStatement(Mutation& m) {
+  if (IsModuleSource(m.source) && m.random->Chance(30)) {
+    if (auto out = EditGenerateModuleItem(m)) return out;
+  }
   auto points = InsertionPoints(m.root, m.source, m.budget);
   const InsertionPoint* point = PickFrom(points, m.random);
   if (!point) return std::nullopt;
@@ -1595,6 +1904,163 @@ std::optional<std::string> EditCrossOver(Mutation& m) {
   return out;
 }
 
+
+// ---------------------------------------------------------------------------
+// Classes and goals.
+
+// Export names of a module, by value.
+std::vector<std::string> ModuleExportNames(TSNode root, std::string_view source) {
+  std::vector<std::string> out;
+  auto value = [&](TSNode node) {
+    std::string text(NodeText(node, source));
+    if (Is(node, "string") && text.size() >= 2) text = text.substr(1, text.size() - 2);
+    out.push_back(text);
+  };
+  for (TSNode statement : ListStatements(root)) {
+    if (!Is(statement, "export_statement")) continue;
+    if (HasDirectToken(statement, "default")) out.push_back("default");
+    TSNode declaration = Field(statement, "declaration");
+    if (!ts_node_is_null(declaration)) {
+      if (HasDirectToken(statement, "default")) continue;
+      Budget local;
+      DeclaredNames(declaration, source, &out, &local);
+      continue;
+    }
+    const uint32_t count = ts_node_named_child_count(statement);
+    for (uint32_t i = 0; i < count; ++i) {
+      TSNode child = ts_node_named_child(statement, i);
+      if (Is(child, "namespace_export")) value(ts_node_named_child(child, 0));
+      if (!Is(child, "export_clause")) continue;
+      const uint32_t specs = ts_node_named_child_count(child);
+      for (uint32_t j = 0; j < specs; ++j) {
+        TSNode spec = ts_node_named_child(child, j);
+        TSNode alias = Field(spec, "alias");
+        if (Is(spec, "export_specifier")) {
+          value(ts_node_is_null(alias) ? Field(spec, "name") : alias);
+        }
+      }
+    }
+  }
+  return out;
+}
+
+// An import or export declaration at the top level of a module.
+std::optional<std::string> EditGenerateModuleItem(Mutation& m) {
+  auto points = InsertionPoints(m.root, m.source, m.budget);
+  points.erase(std::remove_if(points.begin(), points.end(),
+                              [](const InsertionPoint& p) { return !Is(p.list, "program"); }),
+               points.end());
+  const InsertionPoint* point = PickFrom(points, m.random);
+  if (!point) return std::nullopt;
+  const GenContext ctx = ContextFor(point->list, m.source);
+  SeedInfo seed;
+  BuildSeedInfo(m.root, m.source, point->list, ctx, m.budget, &seed);
+  seed.exports = ModuleExportNames(m.root, m.source);
+  if (m.budget->exhausted || m.source.size() + 2 >= m.limit) return std::nullopt;
+  Generator generator(m.random, m.limit - m.source.size() - 2, seed);
+  std::string item;
+  if (!generator.ModuleItem(&item, ctx, 2 + m.random->Below(4))) return std::nullopt;
+  std::string out = InsertStatement(m.source, *point, item);
+  if (out.size() > m.limit) return std::nullopt;
+  return out;
+}
+
+// Private-name uses that refer to the declaration `name` of the class body
+// being walked: nested classes that redeclare `name` shadow it.
+void CollectPrivateUses(TSNode node, std::string_view source, const std::string& name,
+                        std::vector<TSNode>* out, Budget* budget, unsigned depth) {
+  if (ts_node_is_null(node) || depth > kMaxCheckDepth || out->size() >= 256) return;
+  if (budget->node_visits >= kMaxNodeVisits) {
+    budget->exhausted = true;
+    return;
+  }
+  ++budget->node_visits;
+  if (depth > 0 && Is(node, "class_body")) {
+    std::vector<std::string> declared;
+    CollectPrivateDeclarations(node, source, &declared);
+    if (std::find(declared.begin(), declared.end(), name) != declared.end()) return;
+  }
+  if (Is(node, "private_property_identifier")) {
+    if (NodeText(node, source) == name) out->push_back(node);
+    return;
+  }
+  const uint32_t count = ts_node_named_child_count(node);
+  for (uint32_t i = 0; i < count; ++i) {
+    CollectPrivateUses(ts_node_named_child(node, i), source, name, out, budget, depth + 1);
+  }
+}
+
+// Rename one private name of a class, with its uses: to a fresh name, to a
+// sibling name (a get/set pair or a collision), or to an outer class's name
+// (shadowing). Results with early errors are filtered by the caller.
+std::optional<std::string> EditPrivateRename(Mutation& m) {
+  std::vector<TSNode> bodies;
+  Walk(m.root, m.budget, [&](TSNode node, TSNode) {
+    if (Is(node, "class_body") && !ts_node_has_error(node)) {
+      std::vector<std::string> declared;
+      CollectPrivateDeclarations(node, m.source, &declared);
+      if (!declared.empty()) bodies.push_back(node);
+    }
+    return bodies.size() < 256;
+  });
+  const TSNode* body = PickFrom(bodies, m.random);
+  if (!body) return std::nullopt;
+  std::vector<std::string> own;
+  CollectPrivateDeclarations(*body, m.source, &own);
+  const std::string old_name = *PickFrom(own, m.random);
+  std::vector<std::string> others;
+  for (TSNode p = ts_node_parent(*body); !ts_node_is_null(p); p = ts_node_parent(p)) {
+    if (Is(p, "class_body")) CollectPrivateDeclarations(p, m.source, &others);
+  }
+  for (const std::string& name : own) {
+    if (name != old_name) others.push_back(name);
+  }
+  std::string new_name;
+  if (!others.empty() && m.random->Chance(45)) {
+    new_name = *PickFrom(others, m.random);
+  } else {
+    SeedInfo seed;
+    CollectAllNames(m.root, m.source, &seed.reserved, m.budget);
+    new_name = "#" + UniqueName("r", seed, {m.source}, m.random->Next());
+  }
+  if (new_name == old_name) return std::nullopt;
+  std::vector<TSNode> uses;
+  CollectPrivateUses(*body, m.source, old_name, &uses, m.budget, 0);
+  if (uses.empty() || m.budget->exhausted) return std::nullopt;
+  std::string out;
+  size_t last = 0;
+  for (TSNode use : uses) {
+    const size_t start = ts_node_start_byte(use);
+    if (start < last) return std::nullopt;
+    out.append(m.source.substr(last, start - last));
+    out += new_name;
+    last = ts_node_end_byte(use);
+  }
+  out.append(m.source.substr(last));
+  if (out.size() > m.limit) return std::nullopt;
+  return out;
+}
+
+// Switch between Script and Module goals. A script becomes a valid module
+// only without sloppy-only code; a module becomes a valid script only
+// without imports, exports, import.meta, or top-level await. The checker
+// decides which side of that line a result is on.
+std::optional<std::string> EditFlipGoal(Mutation& m) {
+  if (IsModuleSource(m.source)) {
+    size_t end = internal::kModuleTag.size();
+    if (end < m.source.size() && m.source[end] == '\n') ++end;
+    return Replace(m.source, 0, end, "", m.limit);
+  }
+  std::string_view body = m.source;
+  if (body.substr(0, 2) == "#!") {
+    const size_t line_end = body.find('\n');
+    body = line_end == std::string_view::npos ? std::string_view{} : body.substr(line_end + 1);
+  }
+  std::string out = std::string(internal::kModuleTag) + "\n" + std::string(body);
+  if (out.size() > m.limit) return std::nullopt;
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 // Malformed mode.
 
@@ -1664,6 +2130,31 @@ std::optional<std::string> EditDisrupt(Mutation& m) {
   }
 }
 
+// Early errors of `using` declarations and of each goal.
+void AddGoalEarlyErrors(const GenContext& ctx, bool top_level,
+                        std::vector<std::string>* options) {
+  options->insert(options->end(), {
+      "{ using u; }", "{ using let = 1; }", "for (using u in y) {}",
+      "switch (0) { case 0: using u = null; }", "if (1) using u = null;",
+      "L: using u = null;", "class K { static { await using u = null; } }",
+      "{ using {a} = b; }", "{ using u = 1; let u; }",
+      "function f() { await using u = null; }", "{ using u = 1, w; }"});
+  if (ctx.module) {
+    options->insert(options->end(), {
+        "with (a) {}", "010;", "<!-- c\n0;", "var await;", "export {u$ndeclared};",
+        "export default 1; export default 2;", "{ export {}; }", "import.meta = 1;",
+        "function f() { await 0; }", "delete u;", "if (1) function g() {}",
+        "export let x$1 = 0, x$1 = 1;", "export {\"s\"};", "\"\\08\";",
+        "import u from \"/dev/null\"; var u;", "function f(a, a) {}"});
+  } else {
+    options->insert(options->end(), {
+        "import.meta;", "export default 1;", "import u from \"/dev/null\";",
+        "export {};"});
+    if (top_level) options->push_back("using u = null;");
+    if (!ctx.async) options->push_back("await 0;");
+  }
+}
+
 // Parse-time errors built from the seed's own code and context.
 std::optional<std::string> EditEarlyError(Mutation& m) {
   const unsigned pick = m.random->Below(100);
@@ -1705,9 +2196,10 @@ std::optional<std::string> EditEarlyError(Mutation& m) {
   if (!ctx.super_call) options.push_back("super();");
   options.push_back("this.#undeclared;");
   if (!ctx.async) options.push_back("for await (const x of y) {}");
+  AddGoalEarlyErrors(ctx, Is(point->list, "program"), &options);
   options.insert(options.end(), {
       "let let = 1;", "const c;", "1 = 2;", "a?.b = 1;", "++1;", "a ?? b || c;",
-      "-a ** b;", "new import(x);", "import.meta;", "export default 1;",
+      "-a ** b;", "new import(x);",
       "({__proto__: 1, __proto__: 2});", "(a, a) => 1;",
       "function f(a = 1) { \"use strict\"; }", "(function () { \"use strict\"; 010; });",
       "(function () { \"use strict\"; with (a) {} });", "/a/gg;", "/(/;", "/a/uv;",
@@ -1776,6 +2268,10 @@ std::optional<std::string> Apply(Mutation& m, EditKind kind) {
       return EditDisrupt(m);
     case EditKind::kInjectEarlyError:
       return EditEarlyError(m);
+    case EditKind::kPrivateRename:
+      return EditPrivateRename(m);
+    case EditKind::kFlipGoal:
+      return EditFlipGoal(m);
     default:
       return std::nullopt;
   }
@@ -1789,12 +2285,18 @@ std::optional<Result> GenerateProgram(TSParser* parser, uint32_t seed,
                                       size_t max_size, Budget* budget) {
   const size_t limit = std::min(max_size, kMaxSourceBytes);
   const SeedInfo empty;
+  // About one program in ten is a module.
+  const bool module = Random(seed ^ 0x6d2b79f5u).Below(10) == 0;
   // Budgets shrink across attempts; each attempt depends only on the seed.
   for (unsigned attempt = 0; attempt < 7; ++attempt) {
     Random random(seed ^ (0x9e3779b9u * (attempt + 1)));
     Generator generator(&random, kGenerationBytes >> attempt, empty);
     std::string script;
-    if (!generator.Program(&script, attempt < 2 ? 6 : 5 - std::min(attempt, 4u), 5)) continue;
+    const unsigned depth = attempt < 2 ? 6 : 5 - std::min(attempt, 4u);
+    if (!(module ? generator.ModuleProgram(&script, depth, 5)
+                 : generator.Program(&script, depth, 5))) {
+      continue;
+    }
     if (script.size() > limit) continue;
     Budget local;
     Tree tree = Parse(parser, script, &local);
@@ -1872,11 +2374,13 @@ Result MutateImpl(const uint8_t* data, size_t size, const uint8_t* donor,
              {EditKind::kWrapStatement, 12},     {EditKind::kWrapExpression, 10},
              {EditKind::kLiteral, 8},            {EditKind::kBinaryOperator, 8},
              {EditKind::kReuseSubtree, 6},       {EditKind::kDuplicateStatement, 5},
-             {EditKind::kSwapStatements, 5},     {EditKind::kDeleteStatement, 4}};
+             {EditKind::kSwapStatements, 5},     {EditKind::kDeleteStatement, 4},
+             {EditKind::kPrivateRename, 6},      {EditKind::kFlipGoal, 3}};
     if (*parent_errors != 0) rules.push_back({EditKind::kRepairSyntax, 60});
     if (donor_tree) rules.push_back({EditKind::kCrossOver, 70});
   } else {
-    rules = {{EditKind::kDisruptSyntax, 60}, {EditKind::kInjectEarlyError, 40}};
+    rules = {{EditKind::kDisruptSyntax, 60}, {EditKind::kInjectEarlyError, 40},
+             {EditKind::kFlipGoal, 6}};
   }
   const auto order = Order(rules, &random);
   // Occasionally start over from the grammar, keeping fresh programs in the mix.
