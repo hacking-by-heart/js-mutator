@@ -422,6 +422,13 @@ int main() {
     }
   }
   Require(rebinds >= 10, "rebind edits are rare");
+  // An `await` label never moves into async code.
+  for (uint32_t seed = 1; seed <= 600; ++seed) {
+    const auto result = test::Mutate("await: {}", 4096, seed);
+    if (result.edit != EditKind::kWrapStatement) continue;
+    Require(result.source.find("async () => {\nawait:") == std::string::npos,
+            "an await label moved into async code:\n" + result.source);
+  }
   Require(shadowed, "rebind never reused a visible name");
   TestUnicodeTables(syntax);
   TestRawUnicode(syntax);

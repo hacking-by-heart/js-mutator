@@ -902,9 +902,9 @@ Dependencies FindDependencies(TSNode root, std::string_view source,
         NodeText(node, source) == "arguments") {
       d.arguments = true;
     }
-    // `await` and `yield` used as identifiers cannot move into async or
-    // generator code.
-    if (IsIdentifierNode(node)) {
+    // `await` and `yield` used as identifiers or labels cannot move into
+    // async or generator code.
+    if (IsIdentifierNode(node) || std::strcmp(type, "statement_identifier") == 0) {
       const std::string name = DecodeIdentifier(NodeText(node, source));
       if (name == "await") d.await_ = true;
       if (name == "yield") d.yield_ = true;
