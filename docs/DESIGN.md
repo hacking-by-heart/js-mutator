@@ -81,6 +81,12 @@ libFuzzer keeps coverage-increasing inputs and hands them back as parents, so co
 
 Decorators and auto-accessors (`accessor x`) need `--js-decorators` in V8 15.8 and are not generated; neither are `import.defer` and `import.source`. JSX is not JavaScript.
 
+Some valid V8 15.8 forms are Tree-sitter errors, so the generator cannot emit them and the checker cannot vouch for them: `for (using of = null;;)`, `yield: ;` and `(yield) => 0`. Tree-sitter also reads some valid code differently from V8, and the checker maps it back: a block holding one labelled statement or a comma list (`{ L: function f() {} }`, `() => { a: 1 }`) is read as an object literal, `await (x)()` in async code as a call of an identifier `await`, and `export * as default` keeps `default` as an anonymous token.
+
+## Goals
+
+`/*M*/` marks Module code. `/*R*/` and `/*E*/` mark the REPL and eval goals of the V8 harness; `kFlipGoal` picks them for about four flips in ten. The mutator treats them as scripts, so a valid tagged source is a valid script; for `/*R*/` it also has no `await` names, because REPL code is parsed as an async function body.
+
 ## Modules, `using`, and class layouts
 
 A source that starts with the comment `/*M*/` is Module code. About one fresh program in ten is a module: imports of every form (default, namespace, named, string names, `with { ... }` attributes with unique keys), exports of declarations, defaults, local names and re-exports, top-level `await`, and `import.meta`. The generator tracks export names, so none is exported twice, and local exports name only top-level bindings. Specifiers are ones d8 can load (`/dev/null`, `data:` URLs) so whole programs can be checked as modules. The checker adds module rules (sloppy-only code, HTML-like comments, `await` as a name, lexical top-level functions and imports, duplicate or unresolvable exports, import and export only at the top level) and script rules (no import, export, `import.meta`, or top-level `await`).
