@@ -7,12 +7,22 @@
 // so the repetition reaches preparse-data restoration, scope-chain
 // deserialization and class member initializers.
 //
-// Launch with --no-compilation-cache: otherwise libFuzzer's re-runs of an
-// input hit the cache and skip the parse.
+// The compilation cache is off (set before V8 starts): otherwise libFuzzer's
+// re-runs of an input hit the cache and skip the parse.
+//
+// Oracle, log only: a lazy compile that fails with anything but a stack
+// overflow, after the script itself compiled, means the preparser accepted a
+// function the full parser rejects. It is printed to stderr, not a crash,
+// until the cases that are expected (errors the preparser cannot see) are
+// triaged.
 
 #include <stddef.h>
 #include <stdint.h>
 
+#include <stdio.h>
+#include <string.h>
+
+#include <memory>
 #include <vector>
 
 #include "include/v8-context.h"
@@ -24,6 +34,7 @@
 #include "src/api/api-inl.h"
 #include "src/codegen/compiler.h"
 #include "src/execution/isolate-inl.h"
+#include "src/flags/flags.h"
 #include "src/objects/shared-function-info-inl.h"
 #include "test/fuzzer/fuzzer-support.h"
 #include "common.h"
@@ -54,6 +65,20 @@ bool Contains(const std::vector<i::Handle<i::SharedFunctionInfo>>& list,
   return false;
 }
 
+// Clears the exception of a failed lazy compile and logs it unless it is a
+// stack overflow.
+void ReportLazyFailure(i::Isolate* isolate) {
+  if (!isolate->has_exception()) return;
+  i::DirectHandle<i::Object> exception(isolate->exception(), isolate);
+  isolate->clear_exception();
+  std::unique_ptr<char[]> text =
+      i::Object::NoSideEffectsToString(isolate, exception)->ToCString();
+  if (strstr(text.get(), "Maximum call stack size exceeded") == nullptr) {
+    fprintf(stderr, "js-mutator: lazy compile failed after the script compiled: %s\n",
+            text.get());
+  }
+}
+
 void CompileLazyFunctions(i::Isolate* isolate, i::Handle<i::Script> script) {
   i::HandleScope scope(isolate);
   std::vector<i::Handle<i::SharedFunctionInfo>> tried;
@@ -74,9 +99,11 @@ void CompileLazyFunctions(i::Isolate* isolate, i::Handle<i::Script> script) {
       if (sfi->is_compiled()) continue;
       tried.push_back(sfi);
       i::IsCompiledScope is_compiled_scope;
-      if (i::Compiler::Compile(isolate, sfi, i::Compiler::CLEAR_EXCEPTION,
+      if (i::Compiler::Compile(isolate, sfi, i::Compiler::KEEP_EXCEPTION,
                                &is_compiled_scope)) {
         progress = true;
+      } else {
+        ReportLazyFailure(isolate);
       }
     }
   }
@@ -85,6 +112,7 @@ void CompileLazyFunctions(i::Isolate* isolate, i::Handle<i::Script> script) {
 }  // namespace
 
 V8_SYMBOL_USED extern "C" int LLVMFuzzerInitialize(int* argc, char*** argv) {
+  i::v8_flags.compilation_cache = false;
   v8_fuzzer::FuzzerSupport::InitializeFuzzerSupport(argc, argv);
   return 0;
 }
