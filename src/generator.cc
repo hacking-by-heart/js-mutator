@@ -123,6 +123,454 @@ bool ContainsInOperator(std::string_view text) {
   return text.find(" in ") != std::string_view::npos;
 }
 
+// ---------------------------------------------------------------------------
+// Regular expressions.
+
+// Unicode property expressions V8 15.8 accepts in u and v mode.
+constexpr std::string_view kRegexProperties[] = {
+    "L", "Lu", "Ll", "Lt", "Lm", "Lo", "M", "Mn", "Mc", "N", "Nd", "Nl", "No",
+    "P", "Pc", "Pd", "Ps", "S", "Sm", "Sc", "Z", "Zs", "Zl", "C", "Cc", "Cf",
+    "Co", "Cn", "Letter", "Uppercase_Letter", "Decimal_Number", "Punctuation",
+    "General_Category=Letter", "gc=Lu", "General_Category=Nd", "Script=Greek",
+    "Script=Latin", "sc=Cyrl", "Script=Han", "Script=Arabic", "sc=Zyyy",
+    "Script_Extensions=Latin", "scx=Grek", "Script_Extensions=Arabic",
+    "Alphabetic", "Alpha", "ASCII", "Any", "Assigned", "ASCII_Hex_Digit",
+    "Hex_Digit", "White_Space", "Emoji", "Emoji_Presentation",
+    "Extended_Pictographic", "ID_Start", "ID_Continue", "XID_Start",
+    "Uppercase", "Lowercase", "Math", "Dash", "Ideographic", "Cased",
+    "Case_Ignorable", "Changes_When_Casefolded", "Noncharacter_Code_Point",
+    "Regional_Indicator", "Default_Ignorable_Code_Point", "Bidi_Mirrored"};
+
+// Properties of strings: v mode only, never negated.
+constexpr std::string_view kRegexStringProperties[] = {
+    "RGI_Emoji", "Basic_Emoji", "Emoji_Keycap_Sequence",
+    "RGI_Emoji_Flag_Sequence", "RGI_Emoji_Modifier_Sequence",
+    "RGI_Emoji_Tag_Sequence", "RGI_Emoji_ZWJ_Sequence"};
+
+constexpr std::string_view kRegexSyntaxEscapes[] = {
+    "\\^", "\\$", "\\\\", "\\.", "\\*", "\\+", "\\?", "\\(", "\\)",
+    "\\[", "\\]", "\\{", "\\}", "\\|", "\\/"};
+
+constexpr std::string_view kRegexClassEscapes[] = {"\\d", "\\D", "\\w",
+                                                   "\\W", "\\s", "\\S"};
+
+// Annex B: identity escapes, octal escapes, a bare `\c`, and brackets that
+// are not quantifiers. Legacy (non-u, non-v) mode only.
+constexpr std::string_view kRegexLegacyAtoms[] = {
+    "\\a", "\\e", "\\g", "\\i", "\\j", "\\l", "\\m", "\\o", "\\q", "\\y",
+    "\\z", "\\_", "\\-", "\\%", "\\@", "\\#", "\\~", "\\ ", "\\c", "\\8",
+    "\\9", "\\07", "\\377", "\\0", "\\u12", "\\x4", "]", "}", "{a}", "{,}",
+    "\\p{L}", "7", "0"};
+
+// Builds one regular expression literal. Patterns are produced in two passes:
+// the first plans groups and leaves placeholders for back references, the
+// second resolves them once every capture and name is known, so forward and
+// self references appear naturally.
+class RegexBuilder {
+ public:
+  explicit RegexBuilder(Random* random) : random_(random) {}
+
+  std::string Literal() {
+    std::string flags;
+    for (char flag : std::string_view("dgimsy")) {
+      if (random_->Chance(25)) flags += flag;
+    }
+    const unsigned mode = random_->Below(100);
+    if (mode < 30) {
+      mode_ = kUnicode;
+      flags += 'u';
+    } else if (mode < 50) {
+      mode_ = kSets;
+      flags += 'v';
+    }
+    for (size_t n = flags.size(); n > 1; --n) {
+      std::swap(flags[n - 1], flags[random_->Below(static_cast<uint32_t>(n))]);
+    }
+    budget_ = 8 + random_->Below(28);
+    std::string body = Resolve(Disjunction(3, 3));
+    if (body.empty()) body = "(?:)";
+    return "/" + body + "/" + flags;
+  }
+
+ private:
+  enum Mode { kLegacy, kUnicode, kSets };
+  // Back reference placeholders, resolved by Resolve().
+  static constexpr char kNumberedRef = '\x01';
+  static constexpr char kNamedRef = '\x02';
+  static constexpr char kLegacyK = '\x03';
+
+  static bool Contains(const std::vector<std::string>& v, const std::string& s) {
+    return std::find(v.begin(), v.end(), s) != v.end();
+  }
+
+  std::string Disjunction(unsigned depth, unsigned max_alternatives) {
+    // Names declared in one alternative may be declared again in a sibling
+    // alternative, but not anywhere they could both participate.
+    const std::vector<std::string> base = current_;
+    std::vector<std::string> merged = base;
+    const unsigned alternatives =
+        1 + (random_->Chance(30) ? 1 + random_->Below(max_alternatives) : 0);
+    std::string out;
+    for (unsigned a = 0; a < alternatives; ++a) {
+      if (a != 0) out += '|';
+      current_ = base;
+      out += Alternative(depth);
+      for (const auto& name : current_) {
+        if (!Contains(merged, name)) merged.push_back(name);
+      }
+    }
+    current_ = std::move(merged);
+    return out;
+  }
+
+  std::string Alternative(unsigned depth) {
+    const unsigned terms = random_->Chance(8) ? 0 : 1 + random_->Below(4);
+    std::string out;
+    for (unsigned t = 0; t < terms && budget_ > 0; ++t) out += Term(depth);
+    return out;
+  }
+
+  std::string Term(unsigned depth) {
+    bool quantifiable = true;
+    std::string text = Atom(depth, &quantifiable);
+    if (quantifiable && random_->Chance(25)) text += Quantifier();
+    return text;
+  }
+
+  std::string Quantifier() {
+    static constexpr std::string_view kQuantifiers[] = {
+        "*", "+", "?", "*", "+", "?", "{0}", "{1}", "{2}", "{1,}", "{0,1}",
+        "{2,5}", "{3,3}", "{0,4294967295}", "{4294967296,}", "{65536}"};
+    std::string q(random_->Pick(kQuantifiers));
+    if (random_->Chance(30)) q += '?';
+    return q;
+  }
+
+  std::string Atom(unsigned depth, bool* quantifiable) {
+    const unsigned pick = random_->Below(100);
+    if (depth > 0 && budget_ > 3 && pick < 24) return Group(depth - 1, quantifiable);
+    if (budget_ > 0) --budget_;
+    if (pick < 31) {
+      static constexpr std::string_view kAssertions[] = {"^", "$", "\\b", "\\B"};
+      *quantifiable = false;
+      return std::string(random_->Pick(kAssertions));
+    }
+    if (pick < 37) return std::string(1, kNumberedRef);
+    if (pick < 41) return std::string(1, kNamedRef);
+    if (pick < 52) {
+      if (mode_ == kSets) return ClassSet(3, false);
+      return Class();
+    }
+    if (pick < 64) return CharacterEscape();
+    if (pick < 72) {
+      if (mode_ != kLegacy) return Property(mode_ == kSets);
+      if (random_->Chance(15)) return std::string(1, kLegacyK);
+      std::string_view atom = random_->Pick(kRegexLegacyAtoms);
+      if (atom == "\\u12") *quantifiable = random_->Chance(50);
+      return std::string(atom);
+    }
+    if (pick < 76) return ".";
+    return PlainCharacter();
+  }
+
+  std::string Group(unsigned depth, bool* quantifiable) {
+    const unsigned kind = random_->Below(100);
+    if (kind < 20) {
+      ++captures_;
+      return "(" + Disjunction(depth, 2) + ")";
+    }
+    if (kind < 40) {
+      ++captures_;
+      const std::string name = GroupName();
+      current_.push_back(name);
+      return "(?<" + Spell(name) + ">" + Disjunction(depth, 2) + ")";
+    }
+    if (kind < 52) return "(?:" + Disjunction(depth, 2) + ")";
+    if (kind < 66) return Modifiers() + Disjunction(depth, 2) + ")";
+    if (kind < 83) {
+      // Annex B allows quantified lookaheads in legacy mode only.
+      *quantifiable = mode_ == kLegacy;
+      return (random_->Chance(50) ? "(?=" : "(?!") + Disjunction(depth, 2) + ")";
+    }
+    *quantifiable = false;
+    return (random_->Chance(50) ? "(?<=" : "(?<!") + Disjunction(depth, 2) + ")";
+  }
+
+  // `(?ims-ims:`, with every flag at most once and at least one flag.
+  std::string Modifiers() {
+    std::string add;
+    std::string remove;
+    for (char flag : std::string_view("ims")) {
+      switch (random_->Below(3)) {
+        case 1:
+          add += flag;
+          break;
+        case 2:
+          remove += flag;
+          break;
+        default:
+          break;
+      }
+    }
+    if (add.empty() && remove.empty()) add = "i";
+    std::string out = "(?" + add;
+    if (!remove.empty() || random_->Chance(15)) out += "-" + remove;
+    return out + ":";
+  }
+
+  std::string GroupName() {
+    std::vector<std::string> reusable;
+    for (const auto& name : names_) {
+      if (!Contains(current_, name)) reusable.push_back(name);
+    }
+    if (!reusable.empty() && random_->Chance(50)) {
+      return reusable[random_->Below(static_cast<uint32_t>(reusable.size()))];
+    }
+    static constexpr std::string_view kPrefixes[] = {"n", "g", "$", "_",
+                                                     "year", "Ab", "x$"};
+    std::string name =
+        std::string(random_->Pick(kPrefixes)) + std::to_string(names_.size());
+    names_.push_back(name);
+    return name;
+  }
+
+  // A group name, sometimes with its first character written as an escape.
+  std::string Spell(const std::string& name) {
+    if (!random_->Chance(15)) return name;
+    static constexpr char kHex[] = "0123456789ABCDEF";
+    const unsigned char c = static_cast<unsigned char>(name[0]);
+    std::string out = random_->Chance(50) ? "\\u00" : "\\u{";
+    out += kHex[c >> 4];
+    out += kHex[c & 15];
+    if (out[2] == '{') out += '}';
+    return out + name.substr(1);
+  }
+
+  std::string PlainCharacter() {
+    static constexpr std::string_view kChars[] = {
+        "a", "b", "c", "x", "z", "A", "Z", "k", "q", "_", ",", ":", ";", "=",
+        "!", "<", ">", "@", "#", "%", "&", "~", "'", "\"", "-", " "};
+    return std::string(random_->Pick(kChars));
+  }
+
+  static std::string Hex(uint32_t value, unsigned digits) {
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string out(digits, '0');
+    for (unsigned i = 0; i < digits; ++i) {
+      out[digits - 1 - i] = kHex[(value >> (4 * i)) & 15];
+    }
+    return out;
+  }
+
+  // A character escape that is valid in every mode.
+  std::string CharacterEscape() {
+    const unsigned pick = random_->Below(100);
+    if (pick < 15) {
+      static constexpr std::string_view kControls[] = {"\\f", "\\n", "\\r",
+                                                       "\\t", "\\v", "\\0"};
+      return std::string(random_->Pick(kControls));
+    }
+    if (pick < 22) {
+      return std::string("\\c") +
+             static_cast<char>((random_->Chance(50) ? 'a' : 'A') + random_->Below(26));
+    }
+    if (pick < 32) return "\\x" + Hex(random_->Below(256), 2);
+    if (pick < 42) return "\\u" + Hex(random_->Below(0x10000), 4);
+    if (pick < 62) return std::string(random_->Pick(kRegexSyntaxEscapes));
+    if (pick < 82 || mode_ == kLegacy) return std::string(random_->Pick(kRegexClassEscapes));
+    static constexpr std::string_view kUnicode[] = {
+        "\\u{0}", "\\u{41}", "\\u{1F600}", "\\u{10FFFF}", "\\u{000061}",
+        "\\u{D800}", "\\uD83D\\uDE00", "\\uDC00"};
+    return std::string(random_->Pick(kUnicode));
+  }
+
+  std::string Property(bool strings) {
+    if (strings && random_->Chance(20)) {
+      return "\\p{" + std::string(random_->Pick(kRegexStringProperties)) + "}";
+    }
+    return std::string(random_->Chance(70) ? "\\p{" : "\\P{") +
+           std::string(random_->Pick(kRegexProperties)) + "}";
+  }
+
+  // A code point for a class range endpoint.
+  uint32_t CodePoint() {
+    switch (random_->Below(mode_ == kLegacy ? 5 : 6)) {
+      case 0:
+        return 'a' + random_->Below(26);
+      case 1:
+        return 'A' + random_->Below(26);
+      case 2:
+        return '0' + random_->Below(10);
+      case 3:
+        return random_->Below(256);
+      case 4:
+        return random_->Below(0x10000);
+      default:
+        return 0x10000 + random_->Below(0x100000);
+    }
+  }
+
+  std::string ClassCharacter(uint32_t cp) {
+    const bool alnum = (cp >= 'a' && cp <= 'z') || (cp >= 'A' && cp <= 'Z') ||
+                       (cp >= '0' && cp <= '9');
+    if (alnum && random_->Chance(70)) return std::string(1, static_cast<char>(cp));
+    if (cp < 256 && random_->Chance(50)) return "\\x" + Hex(cp, 2);
+    // In u and v mode `\uHHHH\uHHHH` pairs surrogates; braces keep one unit.
+    const bool surrogate = cp >= 0xD800 && cp <= 0xDFFF;
+    if (cp < 0x10000 && (mode_ == kLegacy || (!surrogate && random_->Chance(50)))) {
+      return "\\u" + Hex(cp, 4);
+    }
+    return "\\u{" + Hex(cp, cp < 0x10000 ? 4 : 6) + "}";
+  }
+
+  std::string Range() {
+    const uint32_t lo = CodePoint();
+    const uint32_t span = lo < 0x80 ? 26 : 0x400;
+    const uint32_t limit = mode_ == kLegacy ? 0xFFFF : 0x10FFFF;
+    const uint32_t hi = std::min(limit, lo + random_->Below(span));
+    return ClassCharacter(lo) + "-" + ClassCharacter(hi);
+  }
+
+  // A legacy or u-mode character class.
+  std::string Class() {
+    std::string out = "[";
+    if (random_->Chance(30)) out += '^';
+    const unsigned items = random_->Below(5);
+    for (unsigned i = 0; i < items; ++i) {
+      const unsigned pick = random_->Below(100);
+      if (pick < 30) {
+        out += Range();
+      } else if (pick < 45) {
+        out += random_->Pick(kRegexClassEscapes);
+      } else if (pick < 57) {
+        if (mode_ == kUnicode) {
+          out += Property(false);
+        } else {
+          // Three-digit octal, so a following digit cannot extend it.
+          static constexpr std::string_view kLegacy[] = {
+              "\\c1", "\\c_", "\\d-z", "a-\\w", "\\8", "\\077", "\\c", "\\a"};
+          out += random_->Pick(kLegacy);
+        }
+      } else if (pick < 67) {
+        static constexpr std::string_view kEscapes[] = {"\\b", "\\-", "\\]", "\\\\",
+                                                        "\\/", "\\^", "\\["};
+        out += random_->Pick(kEscapes);
+      } else if (pick < 75) {
+        static constexpr std::string_view kLiterals[] = {".", "*", "+", "?", "(",
+                                                         ")", "{", "}", "|", "$"};
+        out += random_->Pick(kLiterals);
+      } else {
+        out += ClassCharacter(CodePoint());
+      }
+    }
+    return out + "]";
+  }
+
+  // `\q{...}`; only single characters where strings are not allowed.
+  std::string ClassString(bool no_strings) {
+    std::string out = "\\q{";
+    const unsigned alternatives = 1 + random_->Below(3);
+    for (unsigned a = 0; a < alternatives; ++a) {
+      if (a != 0) out += '|';
+      const unsigned length = no_strings ? 1 : random_->Below(4);
+      for (unsigned i = 0; i < length; ++i) {
+        out += random_->Chance(80) ? std::string(1, static_cast<char>('a' + random_->Below(26)))
+                                   : ClassCharacter(CodePoint());
+      }
+    }
+    return out + "}";
+  }
+
+  // An operand of `&&` or `--`.
+  std::string SetOperand(unsigned depth, bool no_strings) {
+    const unsigned pick = random_->Below(100);
+    if (depth > 0 && budget_ > 0 && pick < 40) {
+      --budget_;
+      return ClassSet(depth - 1, no_strings);
+    }
+    if (pick < 55) return std::string(random_->Pick(kRegexClassEscapes));
+    if (pick < 70) return Property(!no_strings);
+    if (pick < 80) return ClassString(no_strings);
+    return ClassCharacter(CodePoint());
+  }
+
+  // A v-mode class: a union, or one kind of set operator per level.
+  std::string ClassSet(unsigned depth, bool no_strings) {
+    std::string out = "[";
+    if (random_->Chance(25)) {
+      out += '^';
+      no_strings = true;
+    }
+    const unsigned kind = random_->Below(100);
+    if (kind < 60) {
+      const unsigned items = random_->Below(5);
+      for (unsigned i = 0; i < items; ++i) {
+        const unsigned pick = random_->Below(100);
+        if (pick < 25) {
+          out += Range();
+        } else if (pick < 60) {
+          out += SetOperand(depth, no_strings);
+        } else if (pick < 75) {
+          static constexpr std::string_view kEscapes[] = {
+              "\\&", "\\!", "\\#", "\\%", "\\,", "\\:", "\\;", "\\<", "\\=",
+              "\\>", "\\@", "\\`", "\\~", "\\-", "\\(", "\\)", "\\[", "\\]",
+              "\\{", "\\}", "\\/", "\\|", "\\\\", "\\b", "\\.", "\\*"};
+          out += random_->Pick(kEscapes);
+        } else {
+          out += ClassCharacter(CodePoint());
+        }
+      }
+    } else {
+      const std::string_view op = kind < 80 ? "&&" : "--";
+      const unsigned operands = 2 + random_->Below(2);
+      for (unsigned i = 0; i < operands; ++i) {
+        if (i != 0) out += op;
+        out += SetOperand(depth, no_strings);
+      }
+    }
+    return out + "]";
+  }
+
+  // Second pass: turn placeholders into references to the planned groups.
+  std::string Resolve(const std::string& body) {
+    std::string out;
+    for (size_t i = 0; i < body.size(); ++i) {
+      const char c = body[i];
+      if (c == kNumberedRef) {
+        if (captures_ == 0 && mode_ != kLegacy) {
+          out += "\\d";
+          continue;
+        }
+        unsigned n = 1 + random_->Below(captures_ == 0 ? 9 : captures_);
+        // Annex B: a number above the group count is an octal or identity escape.
+        if (mode_ == kLegacy && random_->Chance(10)) n = captures_ + 1 + random_->Below(12);
+        out += "\\" + std::to_string(n);
+        if (i + 1 < body.size() && body[i + 1] >= '0' && body[i + 1] <= '9') out += "(?:)";
+      } else if (c == kNamedRef || c == kLegacyK) {
+        if (!names_.empty()) {
+          out += "\\k<" +
+                 Spell(names_[random_->Below(static_cast<uint32_t>(names_.size()))]) + ">";
+        } else if (mode_ != kLegacy) {
+          out += "\\w";
+        } else {
+          // Annex B: without named groups, `\k` is an identity escape.
+          out += c == kLegacyK ? "\\k" : "\\k<n>";
+        }
+      } else {
+        out += c;
+      }
+    }
+    return out;
+  }
+
+  Random* random_;
+  Mode mode_ = kLegacy;
+  unsigned budget_ = 0;
+  unsigned captures_ = 0;
+  std::vector<std::string> names_;    // every declared group name
+  std::vector<std::string> current_;  // names that may co-participate here
+};
+
 }  // namespace
 
 bool NeedsStatementParens(std::string_view text) {
@@ -304,103 +752,7 @@ std::string Generator::TemplateText(bool tagged) {
 }
 
 std::string Generator::RegexLiteral() {
-  std::vector<char> flags;
-  for (char flag : std::string_view("dgimsy")) {
-    if (random_->Chance(25)) flags.push_back(flag);
-  }
-  bool unicode = false;
-  bool sets = false;
-  if (random_->Chance(30)) {
-    unicode = true;
-    flags.push_back('u');
-  } else if (random_->Chance(15)) {
-    sets = true;
-    flags.push_back('v');
-  }
-  for (size_t n = flags.size(); n > 1; --n) {
-    std::swap(flags[n - 1], flags[random_->Below(static_cast<uint32_t>(n))]);
-  }
-
-  static constexpr std::string_view kAtoms[] = {
-      "a", "b", "x", ".", "\\d", "\\D", "\\w", "\\W", "\\s", "\\S", "\\.",
-      "\\/", "\\n", "\\t", "\\u0041", "\\x41", "[abc]", "[^a-z]", "[\\d_]",
-      "[a-z0-9]", "\\*", "\\(", "\\)"};
-  static constexpr std::string_view kUnicodeAtoms[] = {
-      "\\u{1F600}", "\\p{L}", "\\P{Lu}", "\\p{Script=Greek}", "\\p{N}"};
-  static constexpr std::string_view kSetAtoms[] = {
-      "[\\p{L}--[a-z]]", "[[a-z]&&[aeiou]]", "[\\q{abc|d}]", "[[0-9][a-f]]"};
-  static constexpr std::string_view kQuantifiers[] = {"*", "+", "?", "{2}",
-                                                      "{1,}", "{1,3}"};
-  static constexpr std::string_view kAssertions[] = {"^", "$", "\\b", "\\B"};
-
-  unsigned groups = 0;
-  std::vector<std::string> named;
-  unsigned name_counter = 0;
-
-  // Recursive disjunction builder.
-  std::string body;
-  auto atom = [&](auto&& self, unsigned depth) -> std::string {
-    const unsigned pick = random_->Below(100);
-    if (depth > 0 && pick < 18) {
-      const unsigned kind = random_->Below(7);
-      std::string inner = self(self, depth - 1);
-      switch (kind) {
-        case 0:
-          ++groups;
-          return "(" + inner + ")";
-        case 1:
-          return "(?:" + inner + ")";
-        case 2: {
-          ++groups;
-          std::string name = "g" + std::to_string(++name_counter);
-          named.push_back(name);
-          return "(?<" + name + ">" + inner + ")";
-        }
-        case 3:
-          return "(?=" + inner + ")";
-        case 4:
-          return "(?!" + inner + ")";
-        case 5:
-          return "(?<=" + inner + ")";
-        default:
-          return "(?<!" + inner + ")";
-      }
-    }
-    if (pick < 26) return std::string(random_->Pick(kAssertions));
-    if (pick < 30 && groups > 0) {
-      return "\\" + std::to_string(1 + random_->Below(groups));
-    }
-    if (pick < 33 && !named.empty()) {
-      return "\\k<" + named[random_->Below(static_cast<uint32_t>(named.size()))] +
-             ">";
-    }
-    if (unicode && pick < 42) return std::string(random_->Pick(kUnicodeAtoms));
-    if (sets && pick < 42) {
-      return random_->Chance(50) ? std::string(random_->Pick(kSetAtoms))
-                                 : std::string(random_->Pick(kUnicodeAtoms));
-    }
-    return std::string(random_->Pick(kAtoms));
-  };
-  auto term = [&](unsigned depth) {
-    std::string text = atom(atom, depth);
-    const bool quantifiable =
-        !(text == "^" || text == "$" || text == "\\b" || text == "\\B" ||
-          text.rfind("(?=", 0) == 0 || text.rfind("(?!", 0) == 0 ||
-          text.rfind("(?<=", 0) == 0 || text.rfind("(?<!", 0) == 0);
-    if (quantifiable && random_->Chance(30)) {
-      text += random_->Pick(kQuantifiers);
-      if (random_->Chance(30)) text += "?";
-    }
-    return text;
-  };
-  const unsigned alternatives = 1 + (random_->Chance(20) ? random_->Below(2) + 1 : 0);
-  for (unsigned a = 0; a < alternatives; ++a) {
-    if (a != 0) body += "|";
-    const unsigned terms = 1 + random_->Below(3);
-    for (unsigned t = 0; t < terms; ++t) body += term(2);
-  }
-  if (body.empty() || body[0] == '*') body = "a" + body;
-  return "/" + body + "/" + std::string(flags.begin(), flags.end());
+  return RegexBuilder(random_).Literal();
 }
 
 std::string Generator::PropertyName() {

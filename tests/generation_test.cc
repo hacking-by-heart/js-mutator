@@ -92,6 +92,57 @@ void RequireConstructs(const std::map<std::string, unsigned>& counts,
   }
 }
 
+// The regexp grammar reaches back references planned in a second pass,
+// duplicate names in sibling alternatives, modifiers, Annex B escapes, and
+// the v-mode class set grammar.
+void RequireRegexFeatures(const std::vector<std::string>& regexes) {
+  unsigned forward_named = 0, duplicate = 0, modifiers = 0, legacy = 0, sets = 0,
+           strings = 0, class_strings = 0;
+  for (const auto& r : regexes) {
+    const std::string flags = r.substr(r.rfind('/') + 1);
+    const bool v = flags.find('v') != std::string::npos;
+    const bool u = flags.find('u') != std::string::npos;
+    const size_t ref = r.find("\\k<");
+    const size_t group = r.find("(?<");
+    if (ref != std::string::npos && group != std::string::npos) {
+      const size_t close = r.find('>', ref);
+      const std::string name = r.substr(ref + 3, close - ref - 3);
+      const size_t def = r.find("(?<" + name + ">");
+      if (def != std::string::npos && def > ref) ++forward_named;
+    }
+    std::map<std::string, unsigned> names;
+    for (size_t at = r.find("(?<"); at != std::string::npos; at = r.find("(?<", at + 1)) {
+      if (r[at + 3] == '=' || r[at + 3] == '!') continue;
+      if (++names[r.substr(at + 3, r.find('>', at) - at - 3)] == 2) ++duplicate;
+    }
+    if (r.find("(?i") != std::string::npos || r.find("(?-") != std::string::npos ||
+        r.find("(?m") != std::string::npos || r.find("(?s") != std::string::npos) {
+      ++modifiers;
+    }
+    if (!u && !v && (r.find("\\c]") != std::string::npos || r.find("{,}") != std::string::npos ||
+                     r.find("\\8") != std::string::npos)) {
+      ++legacy;
+    }
+    Require(!(u || v) || r.find("{,}") == std::string::npos,
+            "an Annex B quantifier fallback in u/v mode: " + r);
+    if (v && (r.find("&&") != std::string::npos || r.find("--") != std::string::npos)) ++sets;
+    if (r.find("\\p{RGI_") != std::string::npos) {
+      Require(v, "a property of strings outside v mode: " + r);
+      ++strings;
+    }
+    Require(r.find("\\P{RGI_") == std::string::npos, "a negated property of strings: " + r);
+    if (v && r.find("\\q{") != std::string::npos) ++class_strings;
+  }
+  const unsigned floor = static_cast<unsigned>(regexes.size() / 200);
+  Require(regexes.size() > 2000, "generation rarely produces regexps");
+  Require(forward_named > floor, "no forward named back references");
+  Require(duplicate > floor, "no duplicate group names in sibling alternatives");
+  Require(modifiers > floor, "no modifier groups");
+  Require(legacy > floor, "no Annex B regexp syntax");
+  Require(sets > floor, "no v-mode set operations");
+  Require(strings > floor && class_strings > floor, "no v-mode strings");
+}
+
 }  // namespace
 
 int main() {
@@ -101,17 +152,24 @@ int main() {
   std::map<std::string, unsigned> empty_counts;
   unsigned empty_nested = 0;
   std::set<std::string> distinct;
+  std::vector<std::string> regexes;
   for (uint32_t seed = 1; seed <= 20000; ++seed) {
     const auto result = test::Generate(2048, seed);
     Require(result.outcome == Outcome::kGeneratedValidLeaning, "empty input did not generate");
     Require(syntax.Parses(result.source), "generated program did not parse:\n" + result.source);
     for (const auto& type : syntax.Types(result.source)) ++empty_counts[type];
+    syntax.Visit(result.source, [&](TSNode node, std::string_view source) {
+      if (!Is(node, "regex")) return;
+      const uint32_t start = ts_node_start_byte(node);
+      regexes.emplace_back(source.substr(start, ts_node_end_byte(node) - start));
+    });
     if (HasNestedShape(syntax, result.source)) ++empty_nested;
     distinct.insert(result.source);
   }
   RequireConstructs(empty_counts, "generation from empty input");
   Require(distinct.size() >= 18000, "generated programs are not diverse");
   Require(empty_nested > 0, "generation never produced the nested arrow/class/static shape");
+  RequireRegexFeatures(regexes);
 
   // 2. Growth: a seed with only arithmetic grows constructs it lacks, and the
   //    retained output is the next parent (the libFuzzer coverage loop).

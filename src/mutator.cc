@@ -1727,6 +1727,124 @@ std::optional<std::string> EditEarlyError(Mutation& m) {
   return out;
 }
 
+// One regexp early error: a single-point corruption of a seed regexp literal
+// (or of a fresh one when the seed has none), or a flag flip. Each case is a
+// SyntaxError on its own, whatever the original pattern was.
+std::optional<std::string> EditRegexMalformed(Mutation& m) {
+  std::vector<TSNode> regexes;
+  Walk(m.root, m.budget, [&](TSNode node, TSNode) {
+    if (Is(node, "regex") && !ts_node_has_error(node)) regexes.push_back(node);
+    return regexes.size() < 512;
+  });
+  const TSNode* node = PickFrom(regexes, m.random);
+  std::string literal;
+  if (node) {
+    literal = std::string(NodeText(*node, m.source));
+  } else {
+    Generator generator(m.random, m.limit, SeedInfo{});
+    literal = generator.Literal("regex", false, false);
+  }
+  const size_t slash = literal.rfind('/');
+  if (literal.size() < 3 || literal[0] != '/' || slash == 0) return std::nullopt;
+  std::string pattern = literal.substr(1, slash - 1);
+  std::string flags = literal.substr(slash + 1);
+  std::string plain;  // flags without u and v
+  for (char c : flags) {
+    if (c != 'u' && c != 'v') plain += c;
+  }
+  struct Corruption {
+    std::string_view text;
+    char mode;  // 0: any flags, 'u': needs u or v, 'v': needs v
+  };
+  static constexpr Corruption kCorruptions[] = {
+      {"(", 0},                     // Unterminated group
+      {")", 0},                     // Unmatched ')'
+      {"|^*", 0},                   // Nothing to repeat
+      {"|(?:{2})", 0},              // Nothing to repeat / lone quantifier
+      {"a{3,1}", 0},                // numbers out of order in {} quantifier
+      {"a**", 0},                   // Nothing to repeat
+      {"(?a)", 0},                  // Invalid group
+      {"(?<dup>a)(?<dup>b)", 0},    // Duplicate capture group name
+      {"(?<q>a)\\k<zq_missing>", 0},  // Invalid named capture referenced
+      {"(?<1a>x)", 0},              // Invalid capture group name
+      {"(?<\\u0030a>x)", 0},        // Invalid capture group name
+      {"[z-a]", 0},                 // Range out of order in character class
+      {"(?<=a)*", 0},               // Nothing to repeat (lookbehind)
+      {"(?ii:a)", 0},               // Repeated flag in modifiers
+      {"(?-:a)", 0},                // Invalid group (no modifier flags)
+      {"(?i-i:a)", 0},              // Repeated flag in modifiers
+      {"(?i)a", 0},                 // Invalid group
+      {"\\a", 'u'},                 // Invalid escape
+      {"\\c", 'u'},                 // Invalid unicode escape
+      {"{", 'u'},                   // Lone quantifier brackets
+      {"]", 'u'},                   // Lone quantifier brackets
+      {"\\99", 'u'},                // Invalid decimal escape
+      {"\\01", 'u'},                // Invalid decimal escape
+      {"\\u{110000}", 'u'},         // Invalid Unicode escape
+      {"(?=a)+", 'u'},              // Nothing to repeat (lookahead)
+      {"[\\d-z]", 'u'},             // Invalid character class
+      {"\\pL", 'u'},                // Invalid property name
+      {"\\p{Script=Greekk}", 'u'},  // Invalid property name
+      {"\\p{lu}", 'u'},             // Invalid property name
+      {"\\p{General_Category}", 'u'},  // Invalid property name
+      {"\\p{Block=Basic_Latin}", 'u'},  // Invalid property name
+      {"\\p{ASCII=Y}", 'u'},        // Invalid property name
+      {"\\p{}", 'u'},               // Invalid property name
+      {"[a&&b--c]", 'v'},           // Invalid set operation
+      {"[a&&&b]", 'v'},             // Invalid set operation
+      {"[!!]", 'v'},                // Invalid character in character class
+      {"[(]", 'v'},                 // Invalid character in character class
+      {"\\P{RGI_Emoji}", 'v'},      // Negated property of strings
+      {"[^\\p{RGI_Emoji}]", 'v'},   // Negated character class with strings
+      {"[^\\q{ab}]", 'v'},          // Negated character class with strings
+  };
+  const unsigned pick = m.random->Below(100);
+  if (pick < 15) {
+    // Flag flips that are invalid on their own.
+    static constexpr char kFlags[] = "dgimsyuv";
+    switch (m.random->Below(3)) {
+      case 0: {
+        const char c = kFlags[m.random->Below(8)];
+        flags += c;
+        if (std::count(flags.begin(), flags.end(), c) < 2) flags += c;
+        break;
+      }
+      case 1:
+        flags = plain + (m.random->Chance(50) ? "uv" : "vu");
+        break;
+      default: {
+        static constexpr char kUnknown[] = {'a', 'z', 'Q', 'e', '_'};
+        flags += m.random->Pick(kUnknown);
+        break;
+      }
+    }
+  } else {
+    const Corruption& c = m.random->Pick(kCorruptions);
+    if (c.mode == 'u') {
+      flags = plain + (m.random->Chance(70) ? "u" : "v");
+    } else if (c.mode == 'v') {
+      flags = plain + "v";
+    }
+    // `\c` before a letter would be a valid control escape.
+    if (pick < 60 || c.text == "\\c") {
+      pattern += c.text;
+    } else {
+      pattern = std::string(c.text) + pattern;
+    }
+  }
+  const std::string corrupted = "/" + pattern + "/" + flags;
+  if (node) {
+    return Replace(m.source, ts_node_start_byte(*node), ts_node_end_byte(*node), corrupted,
+                   m.limit);
+  }
+  auto points = InsertionPoints(m.root, m.source, m.budget);
+  const InsertionPoint* point = PickFrom(points, m.random);
+  if (!point) return std::nullopt;
+  std::string out = InsertStatement(m.source, *point, corrupted + ";");
+  if (out.size() > m.limit) return std::nullopt;
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 
 struct Weighted {
@@ -1776,6 +1894,8 @@ std::optional<std::string> Apply(Mutation& m, EditKind kind) {
       return EditDisrupt(m);
     case EditKind::kInjectEarlyError:
       return EditEarlyError(m);
+    case EditKind::kRegexMalformed:
+      return EditRegexMalformed(m);
     default:
       return std::nullopt;
   }
@@ -1876,7 +1996,8 @@ Result MutateImpl(const uint8_t* data, size_t size, const uint8_t* donor,
     if (*parent_errors != 0) rules.push_back({EditKind::kRepairSyntax, 60});
     if (donor_tree) rules.push_back({EditKind::kCrossOver, 70});
   } else {
-    rules = {{EditKind::kDisruptSyntax, 60}, {EditKind::kInjectEarlyError, 40}};
+    rules = {{EditKind::kDisruptSyntax, 60}, {EditKind::kInjectEarlyError, 40},
+             {EditKind::kRegexMalformed, 25}};
   }
   const auto order = Order(rules, &random);
   // Occasionally start over from the grammar, keeping fresh programs in the mix.
@@ -1907,7 +2028,8 @@ Result MutateImpl(const uint8_t* data, size_t size, const uint8_t* donor,
               clean ? Outcome::kEditedValidLeaning : Outcome::kEditedMalformed, kind};
     }
     const bool worse = *errors > *parent_errors || (early && !parent_early) ||
-                       kind == EditKind::kInjectEarlyError;
+                       kind == EditKind::kInjectEarlyError ||
+                       kind == EditKind::kRegexMalformed;
     if (!worse) continue;
     return {std::move(*candidate), Outcome::kEditedMalformed, kind};
   }

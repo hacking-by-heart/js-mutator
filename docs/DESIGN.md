@@ -26,7 +26,9 @@ libFuzzer parent (corpus entry)          second input (crossover)
 
 ## Vocabulary and grammar
 
-`generator.h` compiles in the JavaScript keyword and punctuator tables. Identifiers, numbers (decimal, hex, octal, binary, exponents, separators, BigInt, legacy octal in sloppy code), strings (every escape form, line continuations), templates (substitutions, and the invalid escapes that only tagged templates allow), and regular expressions (groups, named groups, backreferences, lookaround, quantifiers, Unicode properties, `v`-mode sets, flags) come from lexical rules.
+`generator.h` compiles in the JavaScript keyword and punctuator tables. Identifiers, numbers (decimal, hex, octal, binary, exponents, separators, BigInt, legacy octal in sloppy code), strings (every escape form, line continuations), templates (substitutions, and the invalid escapes that only tagged templates allow), and regular expressions come from lexical rules.
+
+Regular expressions are built in two passes for one mode (legacy, `u` or `v`). The first pass plans groups under a depth and size budget and leaves placeholders for back references; the second resolves them once every capture and name is known, so forward and self references (numbered and `\k<name>`) appear. Group names may repeat only in sibling alternatives. The grammar covers modifier groups such as `(?i-s:...)`, lookaround, quantifiers, Unicode escapes and properties, Annex B escapes and non-quantifier braces in legacy mode only, and the `v`-mode class set grammar: unions, `&&` and `--` never mixed at one level, nested classes, `\q{...}`, and properties of strings, which never appear under negation. Syntax that needs extra V8 flags is not emitted.
 
 The generator is a recursive grammar over the Script goal. Every rule composes with every other where the language allows it:
 
@@ -56,7 +58,7 @@ The parent is never discarded. For each edit, the mutator picks a position and c
 
 Valid mode requires no new Tree-sitter error nodes and no new early errors. An internal checker covers redeclarations, parameter and catch conflicts, `break`/`continue`/`return` targets, duplicate labels, undeclared or duplicate private names, and duplicate constructors. A parent that is already invalid can only improve. Valid mode never returns the `;` fallback while a regenerated program fits.
 
-**Malformed mode** corrupts tokens (delete, duplicate, replace with a random keyword or punctuator, swap, truncate, open an unterminated string, template, regex or comment) or injects errors that V8 reports at parse time. Some are built from the seed itself: redeclaring one of its `let` bindings, or moving a seed statement that uses `await` or `break` across a function boundary. Others are inserted at real positions: `return` outside a function, `super()` outside a derived constructor, octal literals in strict code, duplicate `__proto__`, invalid regex flags, and more.
+**Malformed mode** corrupts tokens (delete, duplicate, replace with a random keyword or punctuator, swap, truncate, open an unterminated string, template, regex or comment) or injects errors that V8 reports at parse time. Some are built from the seed itself: redeclaring one of its `let` bindings, or moving a seed statement that uses `await` or `break` across a function boundary. Others are inserted at real positions: `return` outside a function, `super()` outside a derived constructor, octal literals in strict code, duplicate `__proto__`, invalid regex flags, and more. A regexp-targeted edit (`kRegexMalformed`) applies one single-point corruption to a seed regexp literal (or to a fresh one), each tied to one V8 regexp error, or flips the flags into an invalid set.
 
 ## Coverage loop and limits
 
