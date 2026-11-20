@@ -29,6 +29,7 @@ enum class EditKind {
   kLaziness,            // change which functions V8 preparses or compiles eagerly
   kCapture,             // reference a binding from a closure, eval or TDZ position
   kRebind,              // redeclare or shadow a visible name
+  kMagicComment,        // rebuild //# sourceURL, debugId, compile-hint comments
 };
 
 struct Config {

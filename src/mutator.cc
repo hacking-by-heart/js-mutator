@@ -10,6 +10,7 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <tree_sitter/api.h>
@@ -22,6 +23,7 @@ namespace {
 
 using internal::DecodeIdentifier;
 using internal::GenContext;
+using internal::CanonicalName;
 using internal::Generator;
 using internal::IsSpecialName;
 using internal::IsStrictReservedWord;
@@ -955,7 +957,8 @@ class EarlyErrors {
     bool simple_catch = false;  // catch (e): `var e` in the body is allowed
   };
 
-  std::string Text(TSNode node) { return std::string(NodeText(node, source_)); }
+  // Identifiers compare by meaning: `\u0061` and `a` are the same name.
+  std::string Text(TSNode node) { return CanonicalName(NodeText(node, source_)); }
 
   // A labelled function declaration declares like a plain one.
   static TSNode Unlabel(TSNode statement) {
@@ -1255,7 +1258,9 @@ class EarlyErrors {
 
   bool PrivateVisible(const State& state, const std::string& name) {
     for (const auto& scope : state.privates) {
-      if (std::find(scope.begin(), scope.end(), name) != scope.end()) return true;
+      for (const std::string& declared : scope) {
+        if (CanonicalName(declared) == name) return true;
+      }
     }
     return false;
   }
@@ -1272,7 +1277,7 @@ class EarlyErrors {
     for (uint32_t i = 0; i < count; ++i) {
       TSNode member = ts_node_named_child(body, i);
       if (!Is(member, "field_definition") && !Is(member, "method_definition")) continue;
-      const std::string name = MemberName(member, source_);
+      const std::string name = CanonicalName(MemberName(member, source_));
       const bool is_static = IsStaticMember(member);
       if (Is(member, "method_definition") && !is_static &&
           (name == "constructor" || name == "'constructor'" ||
@@ -1560,6 +1565,17 @@ bool SourceHasEarlyError(std::string_view source) {
   const TSNode root = ts_tree_root_node(tree.get());
   const auto errors = CountSyntaxErrors(root, &budget);
   return !errors || *errors != 0 || HasEarlyError(root, source, &budget);
+}
+
+bool HasEarlyErrorForTesting(std::string_view source) {
+  Parser parser(ts_parser_new(), ts_parser_delete);
+  if (!parser || !ts_parser_set_language(parser.get(), tree_sitter_javascript())) {
+    return true;
+  }
+  Budget budget;
+  Tree tree = Parse(parser.get(), source, &budget);
+  if (!tree || budget.exhausted) return true;
+  return HasEarlyError(ts_tree_root_node(tree.get()), source, &budget);
 }
 
 }  // namespace internal
@@ -2318,6 +2334,171 @@ std::optional<std::string> EditRebind(Mutation& m) {
 }
 
 // ---------------------------------------------------------------------------
+// Magic comments: //# sourceURL=, sourceMappingURL=, debugId=, and the
+// compile-hint comments, all read by Scanner::TryToParseMagicComment.
+
+// Base64 VLQ, as in source maps: sign in the low bit, 5-bit groups with a
+// continuation bit.
+std::string Base64Vlq(const std::vector<int>& values) {
+  static const char kBase64[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string out;
+  for (int value : values) {
+    uint32_t v = value < 0 ? (static_cast<uint32_t>(-value) << 1) | 1
+                           : static_cast<uint32_t>(value) << 1;
+    do {
+      uint32_t digit = v & 31;
+      v >>= 5;
+      if (v != 0) digit |= 32;
+      out += kBase64[digit];
+    } while (v != 0);
+  }
+  return out;
+}
+
+std::string MagicCommentLine(Random* random, bool at_start) {
+  // `//#` or `//@` must be followed by whitespace to be a magic comment.
+  static constexpr std::string_view kSpaces[] = {" ", " ", " ", "  ", "\t", "\v", "\f",
+                                                 " \t", "\xC2\xA0", "\xEF\xBB\xBF", ""};
+  static constexpr std::string_view kUrls[] = {
+      "", "a.js", "file.js", "http://example.com/a.js", "webpack:///src/x.ts",
+      "data:application/json;base64,eyJ2ZXJzaW9uIjozfQ==", "a b.js", "x'y", "x\"y",
+      "%20", "\\u0041", "\xC3\xA9.js", "a.js.map", "//", "=", "a=b"};
+  static constexpr std::string_view kDebugIds[] = {
+      "85314830-023f-4cf1-a267-535f4e37bb17", "00000000-0000-0000-0000-000000000000",
+      "85314830023f4cf1a267535f4e37bb17", "not-a-uuid", "",
+      "85314830-023f-4cf1-a267-535f4e37bb1", "85314830-023F-4CF1-A267-535F4E37BB17"};
+  static constexpr std::string_view kTrailing[] = {"", "", "", " ", "\t", "  ", " x",
+                                                   " trailing garbage", "'", "\""};
+  const char sign = random->Chance(80) ? '#' : '@';
+  std::string line = "//";
+  line += sign;
+  line += random->Pick(kSpaces);
+  std::string name;
+  std::string value;
+  bool has_value = true;
+  const unsigned pick = random->Below(100);
+  if (pick < 22) {
+    name = "sourceURL";
+    value = std::string(random->Pick(kUrls));
+  } else if (pick < 42) {
+    name = "sourceMappingURL";
+    value = std::string(random->Pick(kUrls));
+  } else if (pick < 56) {
+    name = "debugId";
+    value = std::string(random->Pick(kDebugIds));
+  } else if (pick < 70) {
+    name = "allFunctionsCalledOnLoad";
+    // Only valid before any code, without a value; the rest are variants.
+    has_value = !at_start || random->Chance(25);
+    value = random->Chance(50) ? "" : "1";
+  } else {
+    name = "functionsCalledOnLoad";
+    // Ascending positions as VLQ deltas.
+    std::vector<int> deltas;
+    for (unsigned n = random->Below(6); n > 0; --n) {
+      deltas.push_back(random->Chance(10) ? -static_cast<int>(random->Below(8))
+                                          : static_cast<int>(random->Below(200)));
+    }
+    value = Base64Vlq(deltas);
+    switch (random->Below(8)) {
+      case 0:
+        value += "!";  // not base64
+        break;
+      case 1:
+        value += "g";  // a dangling continuation digit
+        break;
+      case 2:
+        value.insert(0, "=");
+        break;
+      default:
+        break;
+    }
+  }
+  if (random->Chance(5)) name[0] = static_cast<char>(name[0] - 'a' + 'A');
+  line += name;
+  if (has_value) {
+    if (random->Chance(8)) line += " ";  // `name =value` is not a magic comment
+    line += "=";
+    if (random->Chance(15)) line += random->Pick(kSpaces);
+    line += value;
+  }
+  line += random->Pick(kTrailing);
+  return line;
+}
+
+std::optional<std::string> EditMagicComment(Mutation& m) {
+  // Idempotent: drop existing magic comments, then rebuild a fresh set.
+  std::vector<std::pair<size_t, size_t>> drop;
+  Walk(m.root, m.budget, [&](TSNode node, TSNode) {
+    if (Is(node, "comment")) {
+      const std::string_view text = NodeText(node, m.source);
+      if (text.substr(0, 3) == "//#" || text.substr(0, 3) == "//@") {
+        drop.emplace_back(ts_node_start_byte(node), ts_node_end_byte(node));
+      }
+    }
+    return drop.size() < 64;
+  });
+  if (m.budget->exhausted) return std::nullopt;
+  size_t start = 0;
+  if (m.source.substr(0, 2) == "#!") {
+    const size_t line_end = m.source.find('\n');
+    start = line_end == std::string_view::npos ? m.source.size() : line_end + 1;
+  }
+  // Where the block goes: before any code, at EOF, or between statements.
+  size_t position = start;
+  bool at_start = true;
+  bool at_eof = false;
+  const unsigned where = m.random->Below(100);
+  if (where >= 45 && where < 75) {
+    position = m.source.size();
+    at_start = false;
+    at_eof = true;
+  } else if (where >= 75) {
+    auto points = InsertionPoints(m.root, m.source, m.budget);
+    if (const InsertionPoint* point = PickFrom(points, m.random)) {
+      if (!point->at_end || Is(point->list, "program")) {
+        position = point->position;
+        at_start = position <= start;
+        at_eof = position == m.source.size();
+      }
+    }
+  }
+  std::string block;
+  const unsigned lines = 1 + (m.random->Chance(30) ? m.random->Below(3) + 1 : 0);
+  std::string previous;
+  for (unsigned i = 0; i < lines; ++i) {
+    // Repeats of the same comment are part of the mix.
+    std::string line = (i != 0 && m.random->Chance(25))
+                           ? previous
+                           : MagicCommentLine(m.random, at_start);
+    if (i != 0) block += '\n';
+    block += line;
+    previous = std::move(line);
+  }
+  // A comment at EOF may end without a line terminator.
+  if (!at_eof || m.random->Chance(50)) block += '\n';
+  if (position != 0 && m.source[position - 1] != '\n') block.insert(0, "\n");
+  std::string out;
+  size_t cursor = 0;
+  auto copy_until = [&](size_t end) {
+    for (const auto& range : drop) {
+      if (range.second <= cursor || range.first >= end) continue;
+      if (range.first > cursor) out.append(m.source.substr(cursor, range.first - cursor));
+      cursor = std::max(cursor, range.second);
+    }
+    if (end > cursor) out.append(m.source.substr(cursor, end - cursor));
+    cursor = std::max(cursor, end);
+  };
+  std::sort(drop.begin(), drop.end());
+  copy_until(position);
+  out += block;
+  copy_until(m.source.size());
+  if (out.size() > m.limit) return std::nullopt;
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // Malformed mode.
 
 std::vector<TSNode> Leaves(TSNode root, Budget* budget) {
@@ -2844,6 +3025,17 @@ std::optional<std::string> EditEarlyError(Mutation& m) {
       // Assignment targets.
       "[f()] = x;", "({a}) = 1;", "(f``) = 1;", "(f()) ?\?= 1;", "(new f()) = 1;",
       "(function () { \"use strict\"; f() = 1; });", "(a?.b) = 1;"});
+  // Raw look-alikes that are not what they resemble (some of them Tree-sitter
+  // accepts, V8 does not): ZWSP, U+2E2F, emoji and U+0300 in identifiers, NEL
+  // and U+180E as whitespace, U+037E as `;`, a line terminator in a regexp or
+  // ending a line comment early.
+  if (m.random->Chance(30)) {
+    options.insert(options.end(), {
+        "var a\xE2\x80\x8B" "b = 1;", "let \xE2\xB8\xAF = 1;", "var x\xF0\x9F\x98\x80 = 1;",
+        "a\xC2\x85= 1;", "/a\xE2\x80\xA8/;", "// c\xE2\x80\xA8@;", "var \xCC\x80" "a;",
+        "(class { #\xF0\x9F\x98\x80; });", "x \xE1\xA0\x8E= 1;",
+        "let a1 = 1\xCD\xBE let b1;", "'\xE2\x80\xA8\n';"});
+  }
   const std::string* option = PickFrom(options, m.random);
   std::string out = InsertStatement(m.source, *point, *option);
   if (out.size() > m.limit) return std::nullopt;
@@ -2905,6 +3097,8 @@ std::optional<std::string> Apply(Mutation& m, EditKind kind) {
       return EditCapture(m);
     case EditKind::kRebind:
       return EditRebind(m);
+    case EditKind::kMagicComment:
+      return EditMagicComment(m);
     default:
       return std::nullopt;
   }
@@ -3003,7 +3197,7 @@ Result MutateImpl(const uint8_t* data, size_t size, const uint8_t* donor,
              {EditKind::kReuseSubtree, 6},       {EditKind::kDuplicateStatement, 5},
              {EditKind::kSwapStatements, 5},     {EditKind::kDeleteStatement, 4},
              {EditKind::kLaziness, 7},           {EditKind::kCapture, 7},
-             {EditKind::kRebind, 7}};
+             {EditKind::kRebind, 7},             {EditKind::kMagicComment, 3}};
     if (*parent_errors != 0) rules.push_back({EditKind::kRepairSyntax, 60});
     if (donor_tree) rules.push_back({EditKind::kCrossOver, 70});
   } else {
