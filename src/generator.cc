@@ -1783,7 +1783,10 @@ Expr Generator::Call(const GenContext& ctx, unsigned depth) {
     return {Fit(callee, kLHS, kOptional) + TemplateLiteral(ctx, depth, true), kLHS, 0};
   }
   if (pick < 40) {
-    std::string text = "new " + Fit(callee, kLHS, kOptional | kCall);
+    // `new import(x).y` is a SyntaxError: the import call must be wrapped.
+    std::string inner = Fit(callee, kLHS, kOptional | kCall);
+    if (inner.rfind("import(", 0) == 0) inner = "(" + inner + ")";
+    std::string text = "new " + inner;
     if (random_->Chance(20)) return {text, kUpdate, 0};
     return {text + "(" + ArgumentList(ctx, depth) + ")", kLHS, 0};
   }
