@@ -105,6 +105,10 @@ int main() {
     const auto result = test::Generate(2048, seed);
     Require(result.outcome == Outcome::kGeneratedValidLeaning, "empty input did not generate");
     Require(syntax.Parses(result.source), "generated program did not parse:\n" + result.source);
+    // V8 rejects `new import(x).y` and `new super(x).y`; the callee needs parentheses.
+    Require(result.source.find("new import(") == std::string::npos &&
+                result.source.find("new super(") == std::string::npos,
+            "unparenthesized call as a new callee:\n" + result.source);
     for (const auto& type : syntax.Types(result.source)) ++empty_counts[type];
     if (HasNestedShape(syntax, result.source)) ++empty_nested;
     distinct.insert(result.source);

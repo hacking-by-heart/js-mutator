@@ -1449,7 +1449,8 @@ Expr Generator::Member(const GenContext& ctx, unsigned depth) {
   Expr object = ExpressionImpl(ctx, depth);
   std::string base = Fit(object, kLHS, kNumber);
   const bool kept_chain = base == object.text;
-  unsigned flags = kept_chain ? (object.flags & kOptional) : 0;
+  // kCall stays so that `new` parenthesizes `import(x).y` and `super(x).y`.
+  unsigned flags = kept_chain ? (object.flags & (kOptional | kCall)) : 0;
   const bool optional = random_->Chance(18);
   if (optional) flags |= kOptional;
   const std::string dot = optional ? "?." : ".";
