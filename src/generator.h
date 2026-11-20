@@ -64,6 +64,41 @@ inline constexpr std::string_view kPunctuators[] = {
     "&=",  "|=",  "^=",  "&&=",  "||=", "?\?=", "=>",  "#",   "@",   "`",
     "${",  "\"",  "'",   "/*",   "*/",  "//",  "<!--", "-->", "\\"};
 
+// Curated Unicode tables, all checked against V8 15.8 and Tree-sitter.
+enum class UnicodeClass {
+  kIdStart,        // BMP ID_Start (including Other_ID_Start and Nl)
+  kIdStartAstral,  // ID_Start outside the BMP
+  kIdContinue,     // ID_Continue but not ID_Start (Mn, Mc, Nd, Pc, ZWNJ...)
+  kWhiteSpace,     // non-ASCII WhiteSpace
+  kLineTerminator,
+  kLookAlike,      // not in the class it resembles; V8 and Tree-sitter may
+                   // disagree, so only for the malformed share
+};
+
+inline constexpr uint32_t kUnicodeIdStart[] = {
+    0xAA,   0xB5,   0xBA,   0xC0,   0xDF,   0xE9,   0xFF,   0x100,  0x17F,
+    0x391,  0x3C0,  0x410,  0x44F,  0x5D0,  0x627,  0x905,  0xE01,  0x10D0,
+    0x1E00, 0x2071, 0x2118, 0x212E, 0x2160, 0x309B, 0x3005, 0x3042, 0x30A2,
+    0x4E2D, 0xAC00, 0xFB01, 0xFF21, 0xFFDC, 0x1885};
+inline constexpr uint32_t kUnicodeIdStartAstral[] = {
+    0x10000, 0x10400, 0x10480, 0x1D400, 0x1D6A8, 0x1E900, 0x20000, 0x2F800};
+inline constexpr uint32_t kUnicodeIdContinue[] = {
+    0x300,  0x36F,  0x483,  0x660,  0x669,  0x6F0,   0x903,   0x93C,  0x966,
+    0xB7,   0x387,  0x1369, 0x19DA, 0x200C, 0x200D,  0x203F,  0x2040, 0x2054,
+    0xFE33, 0xFE4F, 0xFF10, 0xFF3F, 0x20D0, 0x1D7CE, 0x101FD, 0x104A0, 0xE0100};
+inline constexpr uint32_t kUnicodeWhiteSpace[] = {
+    0xA0, 0x1680, 0x2000, 0x2005, 0x200A, 0x202F, 0x205F, 0x3000, 0xFEFF};
+inline constexpr uint32_t kUnicodeLineTerminator[] = {0x2028, 0x2029};
+inline constexpr uint32_t kUnicodeLookAlike[] = {
+    0x200B, 0x2060, 0x180E, 0x85, 0x1F600, 0x2E2F, 0x37E, 0x2212, 0xFF1B,
+    0xD7,   0xAD};
+
+void AppendUtf8(std::string* out, uint32_t code_point);
+// `\uXXXX` for the BMP, `\u{X}` (or a surrogate pair) otherwise.
+std::string EscapeCodePoint(uint32_t code_point, bool braces);
+// The identifier with \u escapes decoded, so `ab` and `ab` compare equal.
+std::string CanonicalName(std::string_view name);
+
 // Facts gathered from a real seed program, relative to the place where the
 // generated code will be inserted.
 struct SeedInfo {
@@ -147,6 +182,12 @@ class Generator {
 
   // Lexical rules.
   std::string NumberLiteral(bool strict);
+  std::string NumberGrammar();
+  std::string PropertyKey();
+  std::string LongLiteral(std::string_view type);
+  std::string UnicodeChar(UnicodeClass c);
+  uint32_t UnicodeCodePoint(UnicodeClass c);
+  std::string RawUnicodePiece();
   std::string StringLiteral(bool strict);
   std::string TemplateText(bool tagged);
   std::string RegexLiteral();
@@ -206,7 +247,12 @@ class Generator {
   unsigned name_counter_ = 0;
   unsigned nodes_left_ = 0;
   bool avoid_contextual_ = false;
+  // Raw non-ASCII (UTF-8) output for this call; decided once per entry point.
+  bool raw_unicode_ = false;
 };
+
+// Early errors that Tree-sitter does not report (implemented in mutator.cc).
+bool HasEarlyErrorForTesting(std::string_view source);
 
 // True when an expression statement starting with `text` would be parsed as
 // something else (a block, declaration, or `let [` declaration).

@@ -93,9 +93,19 @@ constexpr std::string_view kTemplatePieces[] = {
 constexpr std::string_view kTaggedOnlyPieces[] = {"\\u", "\\xg", "\\u{",
                                                   "\\01", "\\1", "\\u{110000}"};
 
+// Non-ASCII bytes count as identifier characters: the generator only emits
+// non-ASCII text in identifiers from the ID_Start/ID_Continue tables.
 bool IsIdentChar(char c) {
   return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-         (c >= '0' && c <= '9') || c == '_' || c == '$' || c == '\\';
+         (c >= '0' && c <= '9') || c == '_' || c == '$' || c == '\\' ||
+         static_cast<unsigned char>(c) >= 0x80;
+}
+
+int HexValue(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
 }
 
 bool StartsWithWord(std::string_view text, std::string_view word) {
@@ -124,6 +134,84 @@ bool ContainsInOperator(std::string_view text) {
 }
 
 }  // namespace
+
+void AppendUtf8(std::string* out, uint32_t cp) {
+  if (cp < 0x80) {
+    *out += static_cast<char>(cp);
+  } else if (cp < 0x800) {
+    *out += static_cast<char>(0xC0 | (cp >> 6));
+    *out += static_cast<char>(0x80 | (cp & 0x3F));
+  } else if (cp < 0x10000) {
+    *out += static_cast<char>(0xE0 | (cp >> 12));
+    *out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+    *out += static_cast<char>(0x80 | (cp & 0x3F));
+  } else {
+    *out += static_cast<char>(0xF0 | (cp >> 18));
+    *out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+    *out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+    *out += static_cast<char>(0x80 | (cp & 0x3F));
+  }
+}
+
+std::string EscapeCodePoint(uint32_t cp, bool braces) {
+  static const char kHex[] = "0123456789abcdef";
+  auto four = [&](uint32_t unit) {
+    std::string s = "\\u";
+    for (int shift = 12; shift >= 0; shift -= 4) s += kHex[(unit >> shift) & 0xF];
+    return s;
+  };
+  if (braces) {
+    std::string s = "\\u{";
+    bool started = false;
+    for (int shift = 20; shift >= 0; shift -= 4) {
+      const uint32_t digit = (cp >> shift) & 0xF;
+      if (digit != 0 || started || shift == 0) {
+        s += kHex[digit];
+        started = true;
+      }
+    }
+    return s + "}";
+  }
+  if (cp < 0x10000) return four(cp);
+  const uint32_t v = cp - 0x10000;
+  return four(0xD800 + (v >> 10)) + four(0xDC00 + (v & 0x3FF));
+}
+
+std::string CanonicalName(std::string_view name) {
+  if (name.find('\\') == std::string_view::npos) return std::string(name);
+  std::string out;
+  for (size_t i = 0; i < name.size(); ++i) {
+    if (name[i] != '\\' || i + 1 >= name.size() || name[i + 1] != 'u') {
+      out += name[i];
+      continue;
+    }
+    uint32_t cp = 0;
+    size_t j = i + 2;
+    bool ok = false;
+    if (j < name.size() && name[j] == '{') {
+      ++j;
+      while (j < name.size() && HexValue(name[j]) >= 0 && cp <= 0x10FFFF) {
+        cp = cp * 16 + static_cast<uint32_t>(HexValue(name[j++]));
+      }
+      ok = j < name.size() && name[j] == '}' && j > i + 3 && cp <= 0x10FFFF;
+    } else {
+      unsigned n = 0;
+      while (n < 4 && j < name.size() && HexValue(name[j]) >= 0) {
+        cp = cp * 16 + static_cast<uint32_t>(HexValue(name[j++]));
+        ++n;
+      }
+      ok = n == 4;
+      --j;
+    }
+    if (!ok) {
+      out += name[i];
+      continue;
+    }
+    AppendUtf8(&out, cp);
+    i = j;
+  }
+  return out;
+}
 
 bool NeedsStatementParens(std::string_view text) {
   if (text.empty()) return false;
@@ -169,9 +257,9 @@ void Generator::Reset() {
   used_.clear();
   name_counter_ = 0;
   for (std::string_view keyword : kKeywords) used_.insert(std::string(keyword));
-  for (const std::string& name : seed_.reserved) used_.insert(name);
+  for (const std::string& name : seed_.reserved) used_.insert(CanonicalName(name));
   for (const std::string& name : seed_.names) {
-    used_.insert(name);
+    used_.insert(CanonicalName(name));
     scopes_[0].push_back(name);
   }
   const unsigned budget =
@@ -202,15 +290,38 @@ std::string Generator::FreshName(std::string_view prefix) {
   }
   std::string lead;
   if (random_->Chance(8)) lead = random_->Chance(50) ? "$" : "_";
+  // Non-ASCII names: raw UTF-8 in raw mode, otherwise \u escapes. A name keeps
+  // one spelling everywhere it is used.
+  std::string head;
+  std::string tail;
+  if (random_->Chance(raw_unicode_ ? 30 : 2)) {
+    const bool astral = random_->Chance(25);
+    const uint32_t start = UnicodeCodePoint(astral ? UnicodeClass::kIdStartAstral
+                                                   : UnicodeClass::kIdStart);
+    if (raw_unicode_) {
+      AppendUtf8(&head, start);
+    } else {
+      head = EscapeCodePoint(start, astral || random_->Chance(40));
+    }
+    if (random_->Chance(40)) {
+      const uint32_t cont = UnicodeCodePoint(UnicodeClass::kIdContinue);
+      if (raw_unicode_) {
+        AppendUtf8(&tail, cont);
+      } else {
+        tail = EscapeCodePoint(cont, cont > 0xFFFF || random_->Chance(40));
+      }
+    }
+  }
   for (;;) {
-    std::string name = lead + std::string(prefix) + std::to_string(++name_counter_);
-    if (used_.insert(name).second) return name;
+    std::string name =
+        lead + head + std::string(prefix) + tail + std::to_string(++name_counter_);
+    if (used_.insert(CanonicalName(name)).second) return name;
   }
 }
 
 void Generator::Declare(const std::string& name) {
   if (name.empty()) return;
-  used_.insert(name);
+  used_.insert(CanonicalName(name));
   if (scopes_.empty()) scopes_.emplace_back();
   scopes_.back().push_back(name);
 }
@@ -258,7 +369,194 @@ std::string Generator::NumberLiteral(bool strict) {
   if (!strict && random_->Chance(6)) {
     return std::string(random_->Pick(kSloppyNumbers));
   }
+  if (random_->Chance(70)) return NumberGrammar();
   return std::string(random_->Pick(kNumbers));
+}
+
+// Numeric literal grammar: every radix, digit counts around the Smi cutoff
+// (10-11), 16-22 digits, the 53-64-bit range, and rarely up to ~330 decimal
+// digits; long fractions, denormals, exponents, separators, and BigInts.
+// Never emits legacy octal, so the result is legal in strict code.
+std::string Generator::NumberGrammar() {
+  const unsigned radix_pick = random_->Below(100);
+  const unsigned base = radix_pick < 58 ? 10 : radix_pick < 76 ? 16 : radix_pick < 88 ? 8 : 2;
+  auto count_for = [&]() -> unsigned {
+    const unsigned pick = random_->Below(100);
+    if (pick < 34) return 1 + random_->Below(9);
+    if (pick < 54) return 10 + random_->Below(2);
+    if (pick < 72) return 16 + random_->Below(7);
+    if (pick < 96) {
+      switch (base) {
+        case 16:
+          return 13 + random_->Below(4);
+        case 8:
+          return 17 + random_->Below(6);
+        case 2:
+          return 52 + random_->Below(13);
+        default:
+          return 15 + random_->Below(6);
+      }
+    }
+    return 23 + random_->Below(308);
+  };
+  const bool upper = random_->Chance(30);
+  auto digits = [&](unsigned count, unsigned radix, bool nonzero_first) {
+    static const char kDigits[] = "0123456789abcdef";
+    const unsigned mode = random_->Below(100);
+    const bool separators = count > 1 && random_->Chance(15);
+    std::string out;
+    for (unsigned i = 0; i < count; ++i) {
+      unsigned d;
+      if (mode < 55) {
+        d = random_->Below(radix);
+      } else if (mode < 75) {
+        d = radix - 1;  // all-max: 0xFFFF..., 999...
+      } else if (mode < 90) {
+        d = i == 0 ? 1 : 0;  // a power of the radix
+      } else {
+        d = i + 1 == count ? 1 : 0;  // leading zeros
+      }
+      if (i == 0 && nonzero_first && d == 0) d = 1 + random_->Below(radix - 1);
+      // Separators only between two digits, never doubled.
+      if (i != 0 && separators && random_->Chance(25)) out += '_';
+      char c = kDigits[d];
+      if (upper && c >= 'a') c = static_cast<char>(c - 'a' + 'A');
+      out += c;
+    }
+    return out;
+  };
+  if (base != 10) {
+    const char* prefix = base == 16 ? "0x" : base == 8 ? "0o" : "0b";
+    std::string out(prefix);
+    if (random_->Chance(20)) out[1] = static_cast<char>(out[1] - 'a' + 'A');
+    out += digits(count_for(), base, false);
+    if (random_->Chance(20)) out += 'n';
+    return out;
+  }
+  const unsigned form = random_->Below(100);
+  if (form < 6) {
+    // Denormal and underflow edges.
+    std::string out = digits(1 + random_->Below(17), 10, true);
+    if (random_->Chance(50)) out += "." + digits(1 + random_->Below(17), 10, false);
+    return out + "e-" + std::to_string(300 + random_->Below(30));
+  }
+  std::string out;
+  bool integer = true;
+  if (form < 14) {
+    out = "." + digits(count_for(), 10, false);
+    integer = false;
+  } else {
+    out = digits(count_for(), 10, true);
+    if (random_->Chance(30)) {
+      out += ".";
+      if (!random_->Chance(15)) out += digits(count_for(), 10, false);
+      integer = false;
+    }
+  }
+  if (random_->Chance(20)) {
+    static constexpr std::string_view kEdges[] = {"308", "309", "324", "325", "400"};
+    out += random_->Chance(50) ? "e" : "E";
+    if (random_->Chance(50)) out += random_->Chance(50) ? "-" : "+";
+    out += random_->Chance(30) ? std::string(random_->Pick(kEdges))
+                               : digits(1 + random_->Below(3), 10, false);
+    integer = false;
+  }
+  if (integer && random_->Chance(15)) out += 'n';
+  return out;
+}
+
+// A property key: a numeric or BigInt literal 25% of the time. Keys are
+// always strict-safe, so they also work in classes.
+std::string Generator::PropertyKey() {
+  if (random_->Chance(25)) return NumberLiteral(true);
+  return PropertyName();
+}
+
+uint32_t Generator::UnicodeCodePoint(UnicodeClass c) {
+  switch (c) {
+    case UnicodeClass::kIdStart:
+      return random_->Pick(kUnicodeIdStart);
+    case UnicodeClass::kIdStartAstral:
+      return random_->Pick(kUnicodeIdStartAstral);
+    case UnicodeClass::kIdContinue:
+      return random_->Pick(kUnicodeIdContinue);
+    case UnicodeClass::kWhiteSpace:
+      return random_->Pick(kUnicodeWhiteSpace);
+    case UnicodeClass::kLineTerminator:
+      return random_->Pick(kUnicodeLineTerminator);
+    default:
+      return random_->Pick(kUnicodeLookAlike);
+  }
+}
+
+std::string Generator::UnicodeChar(UnicodeClass c) {
+  std::string out;
+  AppendUtf8(&out, UnicodeCodePoint(c));
+  return out;
+}
+
+// Raw text for string literals, templates, and block comments: any table,
+// including line terminators (legal in strings since ES2019).
+std::string Generator::RawUnicodePiece() {
+  static constexpr UnicodeClass kClasses[] = {
+      UnicodeClass::kIdStart,    UnicodeClass::kIdStart,
+      UnicodeClass::kIdStartAstral, UnicodeClass::kIdContinue,
+      UnicodeClass::kWhiteSpace, UnicodeClass::kLineTerminator,
+      UnicodeClass::kLookAlike};
+  std::string out;
+  const unsigned count = 1 + random_->Below(3);
+  for (unsigned i = 0; i < count; ++i) out += UnicodeChar(random_->Pick(kClasses));
+  return out;
+}
+
+// Literals whose length is near the scanner's literal-buffer boundaries
+// (255/256 and 1023/1024 units), optionally with a two-byte unit near the
+// one-byte to two-byte conversion points (about 128 and 512 units in).
+std::string Generator::LongLiteral(std::string_view type) {
+  static constexpr unsigned kLengths[] = {127, 128, 255, 256, 511, 512, 1023, 1024};
+  unsigned length = random_->Pick(kLengths) + random_->Below(5) - 2;
+  while (length > 130 && length * 2 + 32 > limit_) length /= 2;
+  auto letters = [&](unsigned n, int split, const std::string& unit) {
+    std::string out;
+    const bool repeat = random_->Chance(50);
+    for (unsigned i = 0; i < n; ++i) {
+      if (static_cast<int>(i) == split) {
+        out += unit;
+      } else {
+        out += repeat ? 'x' : static_cast<char>('a' + random_->Below(26));
+      }
+    }
+    return out;
+  };
+  if (type == "number") {
+    std::string out(1, static_cast<char>('1' + random_->Below(9)));
+    for (unsigned i = 1; i < length; ++i) {
+      out += static_cast<char>('0' + random_->Below(10));
+    }
+    return out;
+  }
+  if (type == "regex") return "/" + letters(length, -1, "") + "/";
+  int split = -1;
+  std::string unit;
+  if (random_->Chance(60)) {
+    split = static_cast<int>((random_->Chance(50) ? 128 : 512) + random_->Below(5)) - 2;
+    if (split >= static_cast<int>(length)) split = static_cast<int>(length / 2);
+    const bool identifier = type == "identifier";
+    static constexpr uint32_t kIdUnits[] = {0x100, 0x3C0, 0x4E2D, 0x10400};
+    static constexpr uint32_t kUnits[] = {0x100, 0x3C0, 0x4E2D, 0xFFFF, 0x10000, 0x1F600};
+    const uint32_t cp = identifier ? random_->Pick(kIdUnits) : random_->Pick(kUnits);
+    if (raw_unicode_ && random_->Chance(50)) {
+      AppendUtf8(&unit, cp);
+    } else {
+      unit = EscapeCodePoint(cp, identifier ? cp > 0xFFFF || random_->Chance(30)
+                                            : random_->Chance(30));
+    }
+  }
+  const std::string body = letters(length, split, unit);
+  if (type == "identifier") return "L" + body;
+  if (type == "template_string") return "`" + body + "`";
+  const char quote = random_->Chance(50) ? '"' : '\'';
+  return quote + body + quote;
 }
 
 std::string Generator::StringLiteral(bool strict) {
@@ -275,6 +573,10 @@ std::string Generator::StringLiteral(bool strict) {
     }
     if (piece == "\\0" && i + 1 < pieces) {
       out += "\\0 ";
+      continue;
+    }
+    if (raw_unicode_ && random_->Chance(30)) {
+      out += RawUnicodePiece();
       continue;
     }
     out += piece;
@@ -296,6 +598,10 @@ std::string Generator::TemplateText(bool tagged) {
     // `$` immediately followed by `{` would start a substitution.
     if (!out.empty() && out.back() == '$' && !piece.empty() && piece[0] == '{') {
       out += ' ';
+    }
+    if (raw_unicode_ && random_->Chance(30)) {
+      out += RawUnicodePiece();
+      continue;
     }
     out += piece;
   }
@@ -336,6 +642,66 @@ std::string Generator::RegexLiteral() {
   unsigned groups = 0;
   std::vector<std::string> named;
   unsigned name_counter = 0;
+  const bool unicode_mode = unicode || sets;
+  // A group name, raw or escaped; \k<...> reuses the same spelling.
+  auto group_name = [&]() {
+    std::string name;
+    if (random_->Chance(raw_unicode_ ? 40 : 4)) {
+      const bool astral = random_->Chance(25);
+      const uint32_t cp = UnicodeCodePoint(astral ? UnicodeClass::kIdStartAstral
+                                                  : UnicodeClass::kIdStart);
+      if (raw_unicode_) {
+        AppendUtf8(&name, cp);
+      } else {
+        name = EscapeCodePoint(cp, astral || random_->Chance(40));
+      }
+    }
+    name += "g" + std::to_string(++name_counter);
+    if (raw_unicode_ && random_->Chance(20)) {
+      AppendUtf8(&name, UnicodeCodePoint(UnicodeClass::kIdContinue));
+    }
+    return name;
+  };
+  // Raw non-ASCII atoms and classes. Never a raw line terminator; astral
+  // characters inside classes only in u/v mode, where they are one unit.
+  auto raw_bmp = [&]() {
+    static constexpr UnicodeClass kClasses[] = {
+        UnicodeClass::kIdStart, UnicodeClass::kIdContinue, UnicodeClass::kWhiteSpace,
+        UnicodeClass::kLookAlike};
+    for (;;) {
+      const uint32_t cp = UnicodeCodePoint(random_->Pick(kClasses));
+      if (cp < 0x10000) return cp;
+    }
+  };
+  auto raw_atom = [&]() {
+    std::string out;
+    const unsigned pick = random_->Below(100);
+    if (pick < 40) {
+      AppendUtf8(&out, raw_bmp());
+    } else if (pick < 55) {
+      AppendUtf8(&out, UnicodeCodePoint(UnicodeClass::kIdStartAstral));
+    } else {
+      auto member = [&]() {
+        return unicode_mode && random_->Chance(30)
+                   ? UnicodeCodePoint(UnicodeClass::kIdStartAstral)
+                   : raw_bmp();
+      };
+      out = random_->Chance(30) ? "[^" : "[";
+      if (random_->Chance(30)) {
+        uint32_t lo = member();
+        uint32_t hi = member();
+        if (hi < lo) std::swap(hi, lo);
+        AppendUtf8(&out, lo);
+        out += "-";
+        AppendUtf8(&out, hi);
+      } else {
+        const unsigned count = 1 + random_->Below(3);
+        for (unsigned i = 0; i < count; ++i) AppendUtf8(&out, member());
+      }
+      out += "]";
+    }
+    return out;
+  };
 
   // Recursive disjunction builder.
   std::string body;
@@ -352,7 +718,7 @@ std::string Generator::RegexLiteral() {
           return "(?:" + inner + ")";
         case 2: {
           ++groups;
-          std::string name = "g" + std::to_string(++name_counter);
+          std::string name = group_name();
           named.push_back(name);
           return "(?<" + name + ">" + inner + ")";
         }
@@ -374,6 +740,7 @@ std::string Generator::RegexLiteral() {
       return "\\k<" + named[random_->Below(static_cast<uint32_t>(named.size()))] +
              ">";
     }
+    if (raw_unicode_ && pick < 50 && random_->Chance(40)) return raw_atom();
     if (unicode && pick < 42) return std::string(random_->Pick(kUnicodeAtoms));
     if (sets && pick < 42) {
       return random_->Chance(50) ? std::string(random_->Pick(kSetAtoms))
@@ -441,8 +808,30 @@ std::string Generator::StatementList(const GenContext& context, unsigned depth,
       const char next = last ? '\0' : statements[i + 1][0];
       if (last || std::strchr("([`+-/", next) == nullptr) piece.pop_back();
     }
-    if (i != 0) out += "\n";
-    if (!directive && random_->Chance(5)) {
+    if (i != 0) {
+      // Raw Unicode whitespace or line terminators between statements.
+      if (raw_unicode_ && random_->Chance(15)) {
+        out += random_->Chance(40) ? UnicodeChar(UnicodeClass::kLineTerminator)
+                                   : "\n" + UnicodeChar(UnicodeClass::kWhiteSpace);
+      } else {
+        out += "\n";
+      }
+    }
+    if (!directive && raw_unicode_ && random_->Chance(5)) {
+      // Comments with raw text; only block comments may hold line terminators.
+      std::string text;
+      for (unsigned n = 1 + random_->Below(3); n > 0; --n) {
+        text += UnicodeChar(random_->Chance(70) ? UnicodeClass::kIdStart
+                                                : UnicodeClass::kLookAlike);
+      }
+      // No `<!--` here: after a dropped semicolon Tree-sitter reads it as
+      // operators, so a look-alike would become an identifier.
+      if (random_->Chance(50)) {
+        out += "/* " + text + RawUnicodePiece() + " */ ";
+      } else {
+        out += "// " + text + "\n";
+      }
+    } else if (!directive && random_->Chance(5)) {
       switch (random_->Below(5)) {
         case 0:
           out += "/* c */ ";
@@ -510,7 +899,7 @@ std::string Generator::BindingPattern(const GenContext& ctx, unsigned depth,
         } else if (random_->Chance(15)) {
           key = StringLiteral(ctx.strict);
         } else {
-          key = PropertyName();
+          key = PropertyKey();
         }
         std::string value = BindingPattern(ctx, depth - 1, true, names);
         if (random_->Chance(25)) value += default_value();
@@ -1057,7 +1446,7 @@ std::string Generator::ClassText(const GenContext& ctx, unsigned depth,
     const unsigned pick = random_->Below(100);
     if (pick < 62) {
       for (;;) {
-        std::string k = PropertyName();
+        std::string k = PropertyKey();
         if (k == "constructor") continue;
         if (is_static && k == "prototype") continue;
         if (is_field && (k == "get" || k == "set" || k == "static" ||
@@ -1169,7 +1558,7 @@ std::string Generator::ObjectLiteral(const GenContext& ctx, unsigned depth) {
   const unsigned count = random_->Below(5);
   auto key = [&]() -> std::string {
     const unsigned pick = random_->Below(100);
-    if (pick < 60) return PropertyName();
+    if (pick < 60) return PropertyKey();
     if (pick < 75) return StringLiteral(ctx.strict);
     if (pick < 85) return NumberLiteral(true);
     return "[" + Fit(ExpressionImpl(ctx, depth), kAssign) + "]";
@@ -1237,6 +1626,12 @@ Expr Generator::Atom(const GenContext& ctx) {
   // In field initializers and static blocks `this` is the class or instance
   // being defined, the binding those contexts exist to exercise.
   if (ctx.class_field && random_->Chance(25)) return {"this", kPrimary, 0};
+  if (limit_ >= 600 && random_->Below(400) == 0) {
+    static constexpr std::string_view kLongTypes[] = {
+        "string", "string", "template_string", "identifier", "number", "regex"};
+    const std::string_view type = random_->Pick(kLongTypes);
+    return {LongLiteral(type), kPrimary, type == "number" ? kNumber : 0u};
+  }
   const unsigned pick = random_->Below(100);
   std::string name;
   if (pick < 28 && VisibleName(&name, true)) return {name, kPrimary, 0};
@@ -1250,7 +1645,16 @@ Expr Generator::Atom(const GenContext& ctx) {
                       static_cast<uint32_t>(seed_.blocks.size()))] + ")",
             kPrimary, 0};
   }
-  if (pick < 54) return {NumberLiteral(ctx.strict), kPrimary, kNumber};
+  if (pick < 54) {
+    std::string number = NumberLiteral(ctx.strict);
+    if (!random_->Chance(8)) return {number, kPrimary, kNumber};
+    // `-` and `~` chains for constant folding; `- -x`, never `--x`.
+    for (unsigned n = 1 + random_->Below(5); n > 0; --n) {
+      const bool minus = random_->Chance(50);
+      number = (minus ? (number[0] == '-' ? "- " : "-") : "~") + number;
+    }
+    return {number, kUnary, 0};
+  }
   if (pick < 64) return {StringLiteral(ctx.strict), kPrimary, 0};
   if (pick < 68) return {"`" + TemplateText(false) + "`", kPrimary, 0};
   if (pick < 74) return {RegexLiteral(), kPrimary, 0};
@@ -1319,6 +1723,12 @@ Expr Generator::Binary(const GenContext& ctx, unsigned depth) {
   } else {
     l = Fit(left, op.prec);
     r = Fit(right, op.prec + 1);
+  }
+  // Raw Unicode whitespace between tokens (never around `in`, which for-heads
+  // look for literally).
+  if (raw_unicode_ && op.text != "in" && random_->Chance(10)) {
+    const std::string space = UnicodeChar(UnicodeClass::kWhiteSpace);
+    return {l + space + std::string(op.text) + space + r, op.prec, flags};
   }
   return {l + " " + std::string(op.text) + " " + r, op.prec, flags};
 }
@@ -1431,7 +1841,10 @@ Expr Generator::Call(const GenContext& ctx, unsigned depth) {
     return {Fit(callee, kLHS, kOptional) + TemplateLiteral(ctx, depth, true), kLHS, 0};
   }
   if (pick < 40) {
-    std::string text = "new " + Fit(callee, kLHS, kOptional | kCall);
+    std::string target = Fit(callee, kLHS, kOptional | kCall);
+    // `new import(x).y` is a SyntaxError: an import call is no MemberExpression.
+    if (target.rfind("import(", 0) == 0) target = "(" + target + ")";
+    std::string text = "new " + target;
     if (random_->Chance(20)) return {text, kUpdate, 0};
     return {text + "(" + ArgumentList(ctx, depth) + ")", kLHS, 0};
   }
@@ -1567,6 +1980,7 @@ Expr Generator::ExpressionImpl(const GenContext& ctx, unsigned depth) {
 
 bool Generator::Program(std::string* out, unsigned depth,
                         unsigned max_statements) {
+  raw_unicode_ = random_->Chance(10);
   for (unsigned attempt = 0; attempt < 4; ++attempt) {
     Reset();
     if (attempt != 0) nodes_left_ >>= attempt;
@@ -1591,6 +2005,7 @@ bool Generator::Program(std::string* out, unsigned depth,
 
 bool Generator::Statement(std::string* out, const GenContext& context,
                           unsigned depth) {
+  raw_unicode_ = random_->Chance(4);
   for (unsigned attempt = 0; attempt < 4; ++attempt) {
     Reset();
     if (attempt != 0) nodes_left_ >>= attempt;
@@ -1607,6 +2022,7 @@ bool Generator::Statement(std::string* out, const GenContext& context,
 
 bool Generator::Expression(std::string* out, const GenContext& context,
                            unsigned depth) {
+  raw_unicode_ = random_->Chance(4);
   for (unsigned attempt = 0; attempt < 4; ++attempt) {
     Reset();
     if (attempt != 0) nodes_left_ >>= attempt;
@@ -1622,6 +2038,12 @@ bool Generator::Expression(std::string* out, const GenContext& context,
 }
 
 std::string Generator::Literal(std::string_view type, bool strict, bool tagged) {
+  raw_unicode_ = random_->Chance(4);
+  if (limit_ >= 600 && !tagged && random_->Chance(5) &&
+      (type == "number" || type == "string" || type == "regex" ||
+       type == "template_string")) {
+    return LongLiteral(type);
+  }
   if (type == "number") return NumberLiteral(strict);
   if (type == "string") return StringLiteral(strict);
   if (type == "regex") return RegexLiteral();

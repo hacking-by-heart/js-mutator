@@ -50,6 +50,7 @@ if(BUILD_TESTING)
     add_executable(js_mutator_${test_name}_test tests/${test_name}_test.cc)
     target_link_libraries(js_mutator_${test_name}_test PRIVATE js_mutator js_mutator_tree_sitter
                                                               js_mutator_javascript_grammar)
+    target_include_directories(js_mutator_${test_name}_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
     add_test(NAME js_mutator_${test_name}_test COMMAND js_mutator_${test_name}_test)
   endforeach()
   if(JS_MUTATOR_BUILD_LIBFUZZER_ADAPTER)
