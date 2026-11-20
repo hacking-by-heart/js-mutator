@@ -101,13 +101,34 @@ int main() {
   std::map<std::string, unsigned> empty_counts;
   unsigned empty_nested = 0;
   std::set<std::string> distinct;
+  // Cover-grammar finishes, yield terminators, import() options, and
+  // parameter defaults.
+  const char* const kForms[] = {
+      "async(await", "async(yield", ") => ", "async (", "} = ", "[yield]", "(yield)",
+      "? yield : yield", "${yield}", "{with: ", "eval(", "arguments[0]",
+      "class { static {"};
+  std::map<std::string, unsigned> form_counts;
   for (uint32_t seed = 1; seed <= 20000; ++seed) {
     const auto result = test::Generate(2048, seed);
     Require(result.outcome == Outcome::kGeneratedValidLeaning, "empty input did not generate");
     Require(syntax.Parses(result.source), "generated program did not parse:\n" + result.source);
     for (const auto& type : syntax.Types(result.source)) ++empty_counts[type];
     if (HasNestedShape(syntax, result.source)) ++empty_nested;
+    // Not valid in a script without flags (`x.import.meta` is a property).
+    for (const char* banned : {"import.meta", "import.defer", "import.source"}) {
+      for (size_t at = result.source.find(banned); at != std::string::npos;
+           at = result.source.find(banned, at + 1)) {
+        Require(at > 0 && result.source[at - 1] == '.',
+                std::string("valid output uses ") + banned + ":\n" + result.source);
+      }
+    }
+    for (const char* form : kForms) {
+      if (result.source.find(form) != std::string::npos) ++form_counts[form];
+    }
     distinct.insert(result.source);
+  }
+  for (const char* form : kForms) {
+    Require(form_counts[form] > 0, std::string("generation never produced ") + form);
   }
   RequireConstructs(empty_counts, "generation from empty input");
   Require(distinct.size() >= 18000, "generated programs are not diverse");

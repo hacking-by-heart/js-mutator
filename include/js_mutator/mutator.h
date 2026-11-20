@@ -26,6 +26,10 @@ enum class EditKind {
   kGenerateProgram,     // replace the parent with a generated program
   kDisruptSyntax,       // malformed mode: token-level corruption
   kInjectEarlyError,    // malformed mode: an early (parse-time) error
+  kParamScope,          // move seed code into a parameter default
+  kUnwrap,              // replace an expression with one of its operands
+  kDeleteRange,         // delete 2-8 consecutive statements
+  kDeepen,              // nest an expression in many neutral wrappers
 };
 
 struct Config {

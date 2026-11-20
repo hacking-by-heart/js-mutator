@@ -118,6 +118,31 @@ bool Walk(TSNode root, Budget* budget, Visit visit) {
   }
 }
 
+// Walk, passing every ancestor: ts_node_parent costs O(depth), which makes
+// per-node ancestor loops cubic on deeply nested input.
+template <typename Visit>
+bool WalkAncestors(TSNode root, Budget* budget, Visit visit) {
+  Cursor cursor(root);
+  std::vector<TSNode> ancestors;
+  for (;;) {
+    if (budget->node_visits >= kMaxNodeVisits) {
+      budget->exhausted = true;
+      return false;
+    }
+    ++budget->node_visits;
+    TSNode node = ts_tree_cursor_current_node(&cursor.value);
+    if (!visit(node, static_cast<const std::vector<TSNode>&>(ancestors))) return false;
+    if (ts_tree_cursor_goto_first_child(&cursor.value)) {
+      ancestors.push_back(node);
+      continue;
+    }
+    while (!ts_tree_cursor_goto_next_sibling(&cursor.value)) {
+      if (!ts_tree_cursor_goto_parent(&cursor.value)) return true;
+      ancestors.pop_back();
+    }
+  }
+}
+
 bool Is(TSNode node, const char* type) {
   return !ts_node_is_null(node) && std::strcmp(ts_node_type(node), type) == 0;
 }
@@ -688,11 +713,10 @@ void BuildSeedInfo(TSNode root, std::string_view source, TSNode dest,
   if (budget->exhausted) return;
   std::vector<std::string> allowed = info->names;
   for (std::string_view name : kGlobalNames) allowed.emplace_back(name);
-  Walk(root, budget, [&](TSNode node, TSNode) {
+  Walk(root, budget, [&](TSNode node, TSNode parent_node) {
     const char* type = ts_node_type(node);
     const size_t size = ts_node_end_byte(node) - ts_node_start_byte(node);
     // A tagged template may hold escapes that are invalid without its tag.
-    TSNode parent_node = ts_node_parent(node);
     const bool tagged_template = std::strcmp(type, "template_string") == 0 &&
                                  Is(parent_node, "call_expression");
     if (!tagged_template && collect_expressions &&
@@ -1094,7 +1118,8 @@ std::vector<TSNode> ExpressionCandidates(TSNode root, Budget* budget) {
     return false;
   };
   std::vector<TSNode> out;
-  Walk(root, budget, [&](TSNode node, TSNode parent) {
+  WalkAncestors(root, budget, [&](TSNode node, const std::vector<TSNode>& ancestors) {
+    const TSNode parent = ancestors.empty() ? TSNode{} : ancestors.back();
     if (out.size() >= 256) return false;
     if (ts_node_is_null(parent) || ts_node_has_error(node)) return true;
     const char* type = ts_node_type(node);
@@ -1123,7 +1148,8 @@ std::vector<TSNode> ExpressionCandidates(TSNode root, Budget* budget) {
     }
     // A member/call object must stay a valid callee; avoid the optional
     // chain head and assignment-target subtrees.
-    for (TSNode a = parent; !ts_node_is_null(a); a = ts_node_parent(a)) {
+    for (size_t up = ancestors.size(); up-- > 0;) {
+      const TSNode a = ancestors[up];
       if (Is(a, "for_in_statement") && ts_node_start_byte(node) <
                                            ts_node_end_byte(Field(a, "left"))) {
         return true;
@@ -1596,6 +1622,271 @@ std::optional<std::string> EditCrossOver(Mutation& m) {
 }
 
 // ---------------------------------------------------------------------------
+// Parameter scopes, size, and depth.
+
+// Parameter names as written, duplicates included.
+void RawParameterNames(TSNode node, std::string_view source,
+                       std::vector<std::string>* names, unsigned depth = 0) {
+  if (ts_node_is_null(node) || depth > 64) return;
+  const char* type = ts_node_type(node);
+  if (std::strcmp(type, "identifier") == 0 ||
+      std::strcmp(type, "shorthand_property_identifier_pattern") == 0) {
+    names->emplace_back(NodeText(node, source));
+    return;
+  }
+  if (std::strcmp(type, "assignment_pattern") == 0 ||
+      std::strcmp(type, "object_assignment_pattern") == 0) {
+    RawParameterNames(Field(node, "left"), source, names, depth + 1);
+    return;
+  }
+  if (std::strcmp(type, "pair_pattern") == 0) {
+    RawParameterNames(Field(node, "value"), source, names, depth + 1);
+    return;
+  }
+  if (std::strcmp(type, "computed_property_name") == 0) return;
+  const uint32_t count = ts_node_named_child_count(node);
+  for (uint32_t i = 0; i < count; ++i) {
+    RawParameterNames(ts_node_named_child(node, i), source, names, depth + 1);
+  }
+}
+
+// Seed code moved into a function's parameter list as a new default, which
+// gives the function a parameter scope of its own.
+std::optional<std::string> EditParamScope(Mutation& m) {
+  std::vector<TSNode> functions;
+  Walk(m.root, m.budget, [&](TSNode node, TSNode) {
+    if (!IsFunctionType(ts_node_type(node)) || ts_node_has_error(node)) return true;
+    // Accessors have a fixed number of parameters.
+    if (Is(node, "method_definition") &&
+        (HasDirectToken(node, "get") || HasDirectToken(node, "set"))) {
+      return true;
+    }
+    TSNode params = Field(node, "parameters");
+    if (ts_node_is_null(params)) params = Field(node, "parameter");
+    if (ts_node_is_null(params)) return true;
+    // "use strict" is a SyntaxError in a function with non-simple parameters.
+    TSNode body = Field(node, "body");
+    if (Is(body, "statement_block") && ListIsStrict(body, m.source)) return true;
+    // So are duplicate parameter names.
+    std::vector<std::string> names;
+    RawParameterNames(params, m.source, &names);
+    std::sort(names.begin(), names.end());
+    if (std::adjacent_find(names.begin(), names.end()) != names.end()) return true;
+    functions.push_back(node);
+    return functions.size() < 256;
+  });
+  const TSNode* function = PickFrom(functions, m.random);
+  if (!function) return std::nullopt;
+  TSNode params = Field(*function, "parameters");
+  const bool bare = ts_node_is_null(params);  // `x => ...`
+  if (bare) params = Field(*function, "parameter");
+  const GenContext ctx = ContextFor(params, m.source);
+  SeedInfo seed;
+  BuildSeedInfo(m.root, m.source, params, ctx, m.budget, &seed);
+  if (m.budget->exhausted) return std::nullopt;
+  std::string value;
+  const unsigned pick = m.random->Below(100);
+  if (pick < 55 && !seed.expressions.empty()) {
+    value = *PickFrom(seed.expressions, m.random);
+  } else if (pick < 80 && !seed.blocks.empty()) {
+    value = *PickFrom(seed.blocks, m.random);
+  } else {
+    Generator generator(m.random, 512, seed);
+    if (!generator.Expression(&value, ctx, 1 + m.random->Below(4))) return std::nullopt;
+  }
+  const std::string param =
+      UniqueName("p", seed, {value}, m.random->Next()) + " = (" + value + ")";
+  if (bare) {
+    const std::string old(NodeText(params, m.source));
+    const std::string text = m.random->Chance(50) ? "(" + param + ", " + old + ")"
+                                                  : "(" + old + ", " + param + ")";
+    return Replace(m.source, ts_node_start_byte(params), ts_node_end_byte(params), text,
+                   m.limit);
+  }
+  std::vector<TSNode> list;
+  const uint32_t count = ts_node_named_child_count(params);
+  for (uint32_t i = 0; i < count; ++i) {
+    TSNode child = ts_node_named_child(params, i);
+    if (!IsExtra(child)) list.push_back(child);
+  }
+  // Never after a rest parameter. Position 0 is evaluated first.
+  size_t slots = list.size() + 1;
+  if (!list.empty() && Is(list.back(), "rest_pattern")) --slots;
+  const size_t index = m.random->Below(static_cast<uint32_t>(slots));
+  if (index < list.size()) {
+    const size_t at = ts_node_start_byte(list[index]);
+    return Replace(m.source, at, at, param + ", ", m.limit);
+  }
+  if (list.empty()) {
+    const size_t at = ts_node_start_byte(params) + 1;
+    return Replace(m.source, at, at, param, m.limit);
+  }
+  const size_t at = ts_node_end_byte(list.back());
+  return Replace(m.source, at, at, ", " + param, m.limit);
+}
+
+bool IsUnwrapParent(const char* type) {
+  static constexpr std::array<const char*, 15> kTypes = {
+      "binary_expression", "unary_expression", "ternary_expression",
+      "sequence_expression", "call_expression", "member_expression",
+      "subscript_expression", "new_expression", "await_expression",
+      "yield_expression", "update_expression", "assignment_expression",
+      "augmented_assignment_expression", "array", "parenthesized_expression"};
+  for (const char* candidate : kTypes) {
+    if (std::strcmp(type, candidate) == 0) return true;
+  }
+  return false;
+}
+
+bool IsUnwrapChild(const char* type) {
+  static constexpr std::array<const char*, 25> kTypes = {
+      "identifier", "number", "string", "true", "false", "null", "regex",
+      "template_string", "array", "object", "parenthesized_expression",
+      "binary_expression", "unary_expression", "ternary_expression",
+      "call_expression", "member_expression", "subscript_expression",
+      "new_expression", "sequence_expression", "this", "update_expression",
+      "assignment_expression", "augmented_assignment_expression",
+      "await_expression", "yield_expression"};
+  for (const char* candidate : kTypes) {
+    if (std::strcmp(type, candidate) == 0) return true;
+  }
+  return false;
+}
+
+// Replace an expression with one of its own operands. Functions and classes
+// are never unwrapped, so no code leaves the function it depends on.
+std::optional<std::string> EditUnwrap(Mutation& m) {
+  struct Site {
+    TSNode node;
+    TSNode child;
+  };
+  std::vector<Site> sites;
+  for (TSNode node : ExpressionCandidates(m.root, m.budget)) {
+    const char* type = ts_node_type(node);
+    if (!IsUnwrapParent(type)) continue;
+    const uint32_t count = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < count; ++i) {
+      TSNode child = ts_node_named_child(node, i);
+      // The callee and arguments of a call, never its tag's template.
+      if (Is(child, "arguments")) {
+        if (Is(Field(node, "arguments"), "template_string")) continue;
+        const uint32_t args = ts_node_named_child_count(child);
+        for (uint32_t j = 0; j < args; ++j) {
+          TSNode arg = ts_node_named_child(child, j);
+          if (IsUnwrapChild(ts_node_type(arg))) sites.push_back({node, arg});
+        }
+        continue;
+      }
+      if (!IsUnwrapChild(ts_node_type(child)) || ts_node_has_error(child)) continue;
+      if (Is(child, "template_string") && Is(node, "call_expression")) continue;
+      if ((Is(node, "member_expression") || Is(node, "subscript_expression")) &&
+          !ts_node_eq(child, Field(node, "object")) &&
+          !ts_node_eq(child, Field(node, "index"))) {
+        continue;
+      }
+      sites.push_back({node, child});
+    }
+  }
+  const Site* site = PickFrom(sites, m.random);
+  if (!site) return std::nullopt;
+  const size_t start = ts_node_start_byte(site->node);
+  const size_t end = ts_node_end_byte(site->node);
+  std::string text(NodeText(site->child, m.source));
+  const char* type = ts_node_type(site->child);
+  const bool primary = std::strcmp(type, "identifier") == 0 ||
+                       std::strcmp(type, "this") == 0 || std::strcmp(type, "true") == 0 ||
+                       std::strcmp(type, "false") == 0 || std::strcmp(type, "null") == 0 ||
+                       std::strcmp(type, "array") == 0 ||
+                       std::strcmp(type, "parenthesized_expression") == 0;
+  auto word = [](char c) { return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$' || c == '\\'; };
+  const bool joins = (start > 0 && word(m.source[start - 1]) && word(text.front())) ||
+                     (end < m.source.size() && word(m.source[end]) && word(text.back()));
+  const bool statement = Is(ts_node_parent(site->node), "expression_statement");
+  if (!primary || joins || (statement && !Is(site->child, "parenthesized_expression"))) {
+    text = "(" + text + ")";
+  }
+  if (text == NodeText(site->node, m.source)) return std::nullopt;
+  return Replace(m.source, start, end, text, m.limit);
+}
+
+// Delete 2-8 consecutive statements of one list, leaving an empty statement
+// so a later string cannot join the directive prologue.
+std::optional<std::string> EditDeleteRange(Mutation& m) {
+  auto sites = StatementSites(m.root, m.budget);
+  std::vector<const StatementSite*> large;
+  for (const auto& site : sites) {
+    if (site.statements.size() >= 3) large.push_back(&site);
+  }
+  if (large.empty()) return std::nullopt;
+  const StatementSite* site = large[m.random->Below(static_cast<uint32_t>(large.size()))];
+  const size_t total = site->statements.size();
+  const size_t count = std::min<size_t>(2 + m.random->Below(7), total - 1);
+  const size_t first = m.random->Below(static_cast<uint32_t>(total - count + 1));
+  return Replace(m.source, ts_node_start_byte(site->statements[first]),
+                 ts_node_end_byte(site->statements[first + count - 1]), ";", m.limit);
+}
+
+// Wrap one expression k times with context-neutral wrappers, k log-uniform
+// in 16..800 and bounded by the remaining bytes, in one text splice.
+std::optional<std::string> EditDeepen(Mutation& m) {
+  auto candidates = ExpressionCandidates(m.root, m.budget);
+  const TSNode* node = PickFrom(candidates, m.random);
+  if (!node) return std::nullopt;
+  constexpr size_t kMaxLevelBytes = 10;  // "1 ? " and " : 0" plus parentheses
+  const size_t unchanged = m.source.size() + 2;
+  if (unchanged + 16 * kMaxLevelBytes > m.limit) return std::nullopt;
+  const size_t room = m.limit - unchanged;
+  const unsigned octave = m.random->Below(6);
+  const size_t levels =
+      std::min<size_t>((16u << octave) + m.random->Below(16u << octave), 800);
+  // Precedence of the text built so far.
+  enum { kAny, kAssignment, kUnary, kPrimary };
+  int prec = kAny;
+  std::vector<std::string_view> prefix;
+  std::string suffix;
+  size_t used = 0;
+  auto wrap = [&](std::string_view open, std::string_view close, int result) {
+    prefix.push_back(open);
+    suffix.append(close);
+    used += open.size() + close.size();
+    prec = result;
+  };
+  auto need = [&](int min) {
+    if (prec < min) wrap("(", ")", kPrimary);
+  };
+  for (size_t i = 0; i < levels && used + kMaxLevelBytes <= room; ++i) {
+    switch (m.random->Below(5)) {
+      case 0:
+        wrap("(", ")", kPrimary);
+        break;
+      case 1:
+        need(kAssignment);
+        wrap("[", "][0]", kPrimary);
+        break;
+      case 2:
+        need(kAssignment);
+        wrap("1 ? ", " : 0", kAssignment);
+        break;
+      case 3:
+        need(kUnary);
+        wrap("!", "", kUnary);
+        break;
+      default:
+        need(kUnary);
+        wrap("void ", "", kUnary);
+        break;
+    }
+  }
+  std::string text = "(";
+  for (auto it = prefix.rbegin(); it != prefix.rend(); ++it) text.append(*it);
+  text.append(NodeText(*node, m.source));
+  text += suffix;
+  text += ')';
+  return Replace(m.source, ts_node_start_byte(*node), ts_node_end_byte(*node), text,
+                 m.limit);
+}
+
+// ---------------------------------------------------------------------------
 // Malformed mode.
 
 std::vector<TSNode> Leaves(TSNode root, Budget* budget) {
@@ -1664,6 +1955,22 @@ std::optional<std::string> EditDisrupt(Mutation& m) {
   }
 }
 
+// Cover-grammar and optional-chain errors. Reaching
+// AccumulationScope::ValidateDeclaration needs these.
+void AddCoverAndChainErrors(const GenContext& ctx, std::vector<std::string>* options) {
+  options->insert(options->end(), {
+      "(...a, b) => 0;", "(a, ...b = 1) => 0;", "({a = 1});", "async (await) => 0;",
+      "async (...a, b) => 0;", "(a.b) => 0;", "[...a, b] = c;", "({a}) = 1;",
+      "(a, b) = 1;", "async (a, a) => 0;", "(a, ...b,) => 0;", "({a: 1} = b);",
+      "([a]) = b;", "(...a) + 1;", "f(a, ({b = 1}));", "(x, {y = 1}, z);",
+      "a?.?.b;", "a?..b;", "new a?.b();", "a?.b`t`;", "super?.x;", "import();",
+      "import(...a);", "import(a, b, c);", "a?.b++;", "new import(x).y();",
+      "class K { m() { super?.x; } }", "async function f() { (a = await 1) => 0; }",
+      "function* g() { (a = yield) => 0; }"});
+  if (ctx.generator) options->push_back("(a = yield) => 0;");
+  if (ctx.async) options->push_back("(a = await 0) => 0;");
+}
+
 // Parse-time errors built from the seed's own code and context.
 std::optional<std::string> EditEarlyError(Mutation& m) {
   const unsigned pick = m.random->Below(100);
@@ -1721,6 +2028,7 @@ std::optional<std::string> EditEarlyError(Mutation& m) {
       "({ get x(a) {} });", "({ set x() {} });", "async () => await;",
       "function f() { 'use strict'; delete x; }",
       "(function () { \"use strict\"; implements = 1; });"});
+  AddCoverAndChainErrors(ctx, &options);
   const std::string* option = PickFrom(options, m.random);
   std::string out = InsertStatement(m.source, *point, *option);
   if (out.size() > m.limit) return std::nullopt;
@@ -1746,6 +2054,28 @@ std::vector<EditKind> Order(std::vector<Weighted> rules, Random* random) {
     rules.erase(rules.begin() + static_cast<long>(i));
   }
   return order;
+}
+
+// Shrink full inputs and grow small ones: with fill = size / limit above
+// 0.7, deleting edits weigh 4x and generating edits half; below 0.3, the
+// reverse.
+void ScaleForFill(size_t size, size_t limit, std::vector<Weighted>* rules) {
+  if (limit == 0) return;
+  const bool high = size * 10 > limit * 7;
+  const bool low = size * 10 < limit * 3;
+  if (!high && !low) return;
+  for (Weighted& rule : *rules) {
+    const bool shrink = rule.kind == EditKind::kDeleteStatement ||
+                        rule.kind == EditKind::kDeleteRange ||
+                        rule.kind == EditKind::kUnwrap;
+    const bool grow = rule.kind == EditKind::kGenerateStatement ||
+                      rule.kind == EditKind::kGenerateExpression;
+    if ((high && shrink) || (low && grow)) {
+      rule.weight *= 4;
+    } else if ((high && grow) || (low && shrink)) {
+      rule.weight = std::max(1u, rule.weight / 2);
+    }
+  }
 }
 
 std::optional<std::string> Apply(Mutation& m, EditKind kind) {
@@ -1776,6 +2106,14 @@ std::optional<std::string> Apply(Mutation& m, EditKind kind) {
       return EditDisrupt(m);
     case EditKind::kInjectEarlyError:
       return EditEarlyError(m);
+    case EditKind::kParamScope:
+      return EditParamScope(m);
+    case EditKind::kUnwrap:
+      return EditUnwrap(m);
+    case EditKind::kDeleteRange:
+      return EditDeleteRange(m);
+    case EditKind::kDeepen:
+      return EditDeepen(m);
     default:
       return std::nullopt;
   }
@@ -1872,7 +2210,10 @@ Result MutateImpl(const uint8_t* data, size_t size, const uint8_t* donor,
              {EditKind::kWrapStatement, 12},     {EditKind::kWrapExpression, 10},
              {EditKind::kLiteral, 8},            {EditKind::kBinaryOperator, 8},
              {EditKind::kReuseSubtree, 6},       {EditKind::kDuplicateStatement, 5},
-             {EditKind::kSwapStatements, 5},     {EditKind::kDeleteStatement, 4}};
+             {EditKind::kSwapStatements, 5},     {EditKind::kDeleteStatement, 4},
+             {EditKind::kParamScope, 4},         {EditKind::kUnwrap, 4},
+             {EditKind::kDeleteRange, 3},        {EditKind::kDeepen, 2}};
+    ScaleForFill(source.size(), m.limit, &rules);
     if (*parent_errors != 0) rules.push_back({EditKind::kRepairSyntax, 60});
     if (donor_tree) rules.push_back({EditKind::kCrossOver, 70});
   } else {
