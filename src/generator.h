@@ -139,6 +139,10 @@ struct GenContext {
   bool new_target = false;      // `new.target` legal.
   bool class_field = false;     // `arguments` is a SyntaxError here.
   bool strict = false;          // strict-mode code.
+  // `await` and `yield` are plain identifiers: sloppy Script code outside
+  // async functions, generators, and their parameters. Only set by the
+  // generator itself, so seed contexts never use it.
+  bool ident_await_yield = false;
   std::vector<std::string> labels;
   std::vector<std::string> loop_labels;
   std::vector<std::string> private_names;
@@ -267,6 +271,19 @@ class Generator {
   std::string EvalArgument(const GenContext& ctx, unsigned depth);
   Expr Member(const GenContext& ctx, unsigned depth);
   std::string ArgumentList(const GenContext& ctx, unsigned depth);
+
+  // Cover grammar: one list finished as an arrow head, a parenthesized
+  // expression, a destructuring assignment, or an async call or arrow.
+  Expr Cover(const GenContext& ctx, unsigned depth);
+  // A bare `yield` directly before a terminator: ] ) } : , and template end.
+  Expr YieldTerminator(const GenContext& ctx, unsigned depth);
+  // A left-hand-side chain of 3-6 mixed member, call, and template links.
+  Expr Chain(const GenContext& ctx, unsigned depth);
+  // A conditional chain of 3-6 arms.
+  Expr ConditionalChain(const GenContext& ctx, unsigned depth);
+  // A parameter default: direct eval, arguments, or a class with a static
+  // block.
+  std::string SpecialDefault(const GenContext& ctx, unsigned depth);
 
   Random* random_;
   size_t limit_;

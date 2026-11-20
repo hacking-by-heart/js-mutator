@@ -2,6 +2,8 @@
 #include "test_util.h"
 
 #include <cstring>
+#include <algorithm>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -332,7 +334,7 @@ int main() {
     }
   }
   Require(laziness >= 20 && pife >= 3 && nested >= 5, "laziness edits are rare");
-  Require(captures >= 30, "capture edits are rare");
+  Require(captures >= 20, "capture edits are rare");
   Require(evals >= 10, "direct eval statements are rare");
   Require(lazy_errors >= 10, "early errors in lazy bodies are rare");
   unsigned generated_eval = 0;
@@ -397,7 +399,7 @@ int main() {
       "function f(a, b = () => a) { let x = a; try { g(); } catch (e) { x = e; } return x; }";
   unsigned rebinds = 0;
   bool shadowed = false;
-  for (uint32_t seed = 1; seed <= 400; ++seed) {
+  for (uint32_t seed = 1; seed <= 1200; ++seed) {
     const auto result = test::Mutate(scoped, 4096, seed);
     if (result.edit != EditKind::kRebind) continue;
     ++rebinds;
@@ -417,6 +419,70 @@ int main() {
   TestRawUnicode(syntax);
   TestLiterals(syntax);
   TestMagicComments(syntax);
+  // Parameter scopes, unwrapping, range deletion, and deepening.
+  const std::string program =
+      "function s(a) { \"use strict\"; return a + 1; }\n"
+      "function d(a, a) { return a * 2; }\n"
+      "function t(b, ...r) { const k = [b, r]; return k.length ? b : -b; }\n"
+      "const u = x => x + 1;\n"
+      "let n = t(1, 2) + u(3) * s(4);\n"
+      "n = (n, typeof n === 'number') ? n : 0;\n"
+      "if (n) { n++; n--; n += 2; n -= 1; }\n";
+  std::map<EditKind, unsigned> kinds;
+  unsigned deep = 0;
+  for (uint32_t seed = 1; seed <= 3000; ++seed) {
+    const auto result = test::Mutate(program, 8192, seed);
+    ++kinds[result.edit];
+    if (result.edit == EditKind::kParamScope) {
+      Require(result.source.find("function s(a) {") != std::string::npos &&
+                  result.source.find("function d(a, a) {") != std::string::npos,
+              "parameters added to a strict or duplicate-parameter function:\n" +
+                  result.source);
+      Require(result.source.find("...r)") != std::string::npos,
+              "a parameter was added after a rest parameter:\n" + result.source);
+    }
+    if (result.edit == EditKind::kDeepen) {
+      int level = 0;
+      int max_level = 0;
+      for (char c : result.source) {
+        if (c == '(' || c == '[') max_level = std::max(max_level, ++level);
+        if (c == ')' || c == ']') --level;
+      }
+      if (max_level >= 16) ++deep;
+    }
+  }
+  for (EditKind kind : {EditKind::kParamScope, EditKind::kUnwrap, EditKind::kDeleteRange,
+                        EditKind::kDeepen}) {
+    Require(kinds[kind] >= 10, "a size, depth, or parameter edit is rarely applied");
+  }
+  Require(deep >= kinds[EditKind::kDeepen] / 2, "deepening rarely nests 16 levels");
+
+  // Fill-aware weights: a nearly full input shrinks more often.
+  auto shrink_share = [&](size_t limit) {
+    unsigned shrink = 0;
+    for (uint32_t seed = 1; seed <= 600; ++seed) {
+      const auto edit = test::Mutate(program, limit, seed).edit;
+      if (edit == EditKind::kDeleteStatement || edit == EditKind::kDeleteRange ||
+          edit == EditKind::kUnwrap) {
+        ++shrink;
+      }
+    }
+    return shrink;
+  };
+  const unsigned full = shrink_share(program.size() + program.size() / 4);
+  const unsigned roomy = shrink_share(program.size() * 8);
+  Require(full > 3 * roomy, "fill does not steer edits toward shrinking");
+
+  // Malformed mode includes cover-grammar and optional-chain errors.
+  unsigned cover_errors = 0;
+  for (uint32_t seed = 1; seed <= 2000; ++seed) {
+    const auto result = test::Mutate(parents[1], 4096, seed, 0);
+    for (const char* snippet : {"(...a, b) => 0;", "({a = 1});", "async (await) => 0;",
+                                "a?.?.b;", "new a?.b();", "import(...a);"}) {
+      if (result.source.find(snippet) != std::string::npos) ++cover_errors;
+    }
+  }
+  Require(cover_errors > 0, "malformed mode never emits cover-grammar errors");
   std::cout << "mutator contract: ok\n";
   return 0;
 }

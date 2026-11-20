@@ -170,6 +170,13 @@ int main() {
   std::set<std::string> distinct;
   std::vector<bool> shapes(kNameShapes.size(), false);
   std::vector<std::string> regexes;
+  // Cover-grammar finishes, yield terminators, import() options, and
+  // parameter defaults.
+  const char* const kForms[] = {
+      "async(await", "async(yield", ") => ", "async (", "} = ", "[yield]", "(yield)",
+      "? yield : yield", "${yield}", "{with: ", "eval(", "arguments[0]",
+      "class { static {"};
+  std::map<std::string, unsigned> form_counts;
   for (uint32_t seed = 1; seed <= 20000; ++seed) {
     const auto result = test::Generate(2048, seed);
     Require(result.outcome == Outcome::kGeneratedValidLeaning, "empty input did not generate");
@@ -186,7 +193,21 @@ int main() {
       regexes.emplace_back(source.substr(start, ts_node_end_byte(node) - start));
     });
     if (HasNestedShape(syntax, result.source)) ++empty_nested;
+    // Not valid in a script without flags (`x.import.meta` is a property).
+    for (const char* banned : {"import.meta", "import.defer", "import.source"}) {
+      for (size_t at = result.source.find(banned); at != std::string::npos;
+           at = result.source.find(banned, at + 1)) {
+        Require(at > 0 && result.source[at - 1] == '.',
+                std::string("valid output uses ") + banned + ":\n" + result.source);
+      }
+    }
+    for (const char* form : kForms) {
+      if (result.source.find(form) != std::string::npos) ++form_counts[form];
+    }
     distinct.insert(result.source);
+  }
+  for (const char* form : kForms) {
+    Require(form_counts[form] > 0, std::string("generation never produced ") + form);
   }
   RequireConstructs(empty_counts, "generation from empty input");
   for (size_t g = 0; g < kNameShapes.size(); ++g) {

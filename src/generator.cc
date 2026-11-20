@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <set>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -40,6 +41,7 @@ enum Flag : unsigned {
   kCall = 1u << 3,       // call or import()
   kNumber = 1u << 4,     // numeric literal (1.x is not member access)
   kPrivate = 1u << 5,    // ends in a private member access
+  kImportCall = 1u << 6, // an import() call or a chain starting with one
 };
 
 using Expr = Generator::Expr;
@@ -1548,6 +1550,8 @@ std::string Generator::Parameters(const GenContext& ctx, unsigned depth,
         std::string ignored;
         if (pick < 12) {
           value = ClassText(ctx, d, false, &ignored);
+        } else if (pick < 18) {
+          value = SpecialDefault(ctx, d);
         } else if (pick < 22) {
           value = ArrowFunction(ctx, d);
         } else if (pick < 28) {
@@ -1646,7 +1650,11 @@ std::string Generator::ForInOfStatement(const GenContext& ctx, unsigned depth) {
     // Annex B: for (var x = init in obj)
     std::string name = FreshName("v");
     names.push_back(name);
-    head = "var " + name + " = " + Fit(ExpressionImpl(ctx, depth > 0 ? depth - 1 : 0), kBitOr);
+    // A bare `yield` before `in` ends the initializer.
+    head = "var " + name + " = " +
+           (ctx.generator && random_->Chance(25)
+                ? std::string("yield")
+                : Fit(ExpressionImpl(ctx, depth > 0 ? depth - 1 : 0), kBitOr));
   } else if (pick >= 80 && pick < 88) {
     // Parenthesized and (sloppy) call targets.
     head = !ctx.strict && random_->Chance(30) ? "(" + CallTarget(ctx, depth) + ")"
@@ -2028,6 +2036,7 @@ std::string Generator::FunctionTail(const GenContext& outer, unsigned depth,
   body_ctx.switch_stmt = false;
   body_ctx.labels.clear();
   body_ctx.loop_labels.clear();
+  if (body_ctx.async || body_ctx.generator) body_ctx.ident_await_yield = false;
   // await and yield expressions are early errors in parameter lists.
   GenContext param_ctx = body_ctx;
   param_ctx.async = false;
@@ -2116,6 +2125,7 @@ std::string Generator::ArrowFunction(const GenContext& ctx, unsigned depth) {
   body.switch_stmt = false;
   body.labels.clear();
   body.loop_labels.clear();
+  if (is_async) body.ident_await_yield = false;
   GenContext param_ctx = body;
   param_ctx.async = false;
 
@@ -2709,16 +2719,36 @@ Expr Generator::Call(const GenContext& ctx, unsigned depth) {
     return {"super(" + ArgumentList(ctx, depth) + ")", kLHS, kCall};
   }
   if (pick < 14) {
-    return {"import(" + Fit(ExpressionImpl(ctx, depth), kAssign) + ")", kLHS, kCall};
+    // The options argument has shipped, so all of these are valid in a
+    // script; import.meta, import.defer, and import.source are not.
+    std::string text = "import(" + Fit(ExpressionImpl(ctx, depth), kAssign);
+    switch (random_->Below(6)) {
+      case 0:
+        text += ",";
+        break;
+      case 1:
+        text += random_->Chance(50) ? ", {with: {type: \"json\"}}"
+                                    : ", {with: {}},";
+        break;
+      case 2:
+        text += ", " + Fit(ExpressionImpl(ctx, depth), kAssign) +
+                (random_->Chance(50) ? "," : "");
+        break;
+      default:
+        break;
+    }
+    return {text + ")", kLHS, kCall | kImportCall};
   }
   Expr callee = ExpressionImpl(ctx, depth);
   if (pick < 26) {
     // Tagged templates may not be part of an optional chain.
-    return {Fit(callee, kLHS, kOptional) + TemplateLiteral(ctx, depth, true), kLHS, 0};
+    std::string tag = Fit(callee, kLHS, kOptional);
+    const unsigned flags = tag == callee.text ? (callee.flags & kImportCall) : 0;
+    return {tag + TemplateLiteral(ctx, depth, true), kLHS, flags};
   }
   if (pick < 40) {
-    std::string target = Fit(callee, kLHS, kOptional | kCall);
-    // `new import(x).y` is a SyntaxError: an import call is no MemberExpression.
+    // `new import(x).y` is a SyntaxError; parenthesize such callees.
+    std::string target = Fit(callee, kLHS, kOptional | kCall | kImportCall);
     if (target.rfind("import(", 0) == 0) target = "(" + target + ")";
     std::string text = "new " + target;
     if (random_->Chance(20)) return {text, kUpdate, 0};
@@ -2726,7 +2756,8 @@ Expr Generator::Call(const GenContext& ctx, unsigned depth) {
   }
   std::string text = Fit(callee, kLHS);
   const bool kept_chain = text == callee.text;
-  unsigned flags = kCall | (kept_chain ? (callee.flags & kOptional) : 0);
+  unsigned flags =
+      kCall | (kept_chain ? (callee.flags & (kOptional | kImportCall)) : 0);
   if (random_->Chance(15)) {
     flags |= kOptional;
     return {text + "?.(" + ArgumentList(ctx, depth) + ")", kLHS, flags};
@@ -2738,7 +2769,7 @@ Expr Generator::Member(const GenContext& ctx, unsigned depth) {
   Expr object = ExpressionImpl(ctx, depth);
   std::string base = Fit(object, kLHS, kNumber);
   const bool kept_chain = base == object.text;
-  unsigned flags = kept_chain ? (object.flags & kOptional) : 0;
+  unsigned flags = kept_chain ? (object.flags & (kOptional | kImportCall)) : 0;
   const bool optional = random_->Chance(18);
   if (optional) flags |= kOptional;
   const std::string dot = optional ? "?." : ".";
@@ -2759,7 +2790,7 @@ Expr Generator::ExpressionImpl(const GenContext& ctx, unsigned depth) {
   enum Kind {
     kAtom, kBinary, kCall, kMember, kArray, kObject, kTemplate, kUnary,
     kConditional, kAssignment, kSequence, kArrow, kFunction, kClass, kYield,
-    kPrivateIn, kCount
+    kPrivateIn, kCover, kChain, kConditionalChain, kYieldTerminator, kCount
   };
   unsigned weights[kCount] = {};
   weights[kAtom] = 16;
@@ -2778,6 +2809,10 @@ Expr Generator::ExpressionImpl(const GenContext& ctx, unsigned depth) {
   weights[kClass] = 4;
   weights[kYield] = ctx.generator ? 4 : 0;
   weights[kPrivateIn] = ctx.private_names.empty() ? 0 : 2;
+  weights[kCover] = 4;
+  weights[kChain] = 3;
+  weights[kConditionalChain] = 1;
+  weights[kYieldTerminator] = ctx.generator ? 3 : 0;
   unsigned total = 0;
   for (unsigned w : weights) total += w;
   unsigned roll = random_->Below(total);
@@ -2845,12 +2880,352 @@ Expr Generator::ExpressionImpl(const GenContext& ctx, unsigned depth) {
       const std::string head = pick < 40 ? "yield* " : "yield ";
       return {head + Fit(ExpressionImpl(ctx, d), kAssign), kAssign, 0};
     }
+    case kCover:
+      return Cover(ctx, d);
+    case kChain:
+      return Chain(ctx, d);
+    case kConditionalChain:
+      return ConditionalChain(ctx, d);
+    case kYieldTerminator:
+      return YieldTerminator(ctx, d);
+    case kPrivateIn:
     default: {
       const std::string& name = ctx.private_names[random_->Below(
           static_cast<uint32_t>(ctx.private_names.size()))];
       return {name + " in " + Fit(ExpressionImpl(ctx, d), kShift), kRel, 0};
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Cover grammar, yield terminators, and left-hand-side chains.
+
+std::string Generator::SpecialDefault(const GenContext& ctx, unsigned depth) {
+  const unsigned pick = random_->Below(100);
+  if (pick < 45) {
+    static constexpr std::string_view kCode[] = {"\"0\"", "\"arguments\"",
+                                                 "\"this\"", "\"() => 1\""};
+    std::string code;
+    if (random_->Chance(30)) {
+      code = "\"var " + FreshName("e") + "\"";
+    } else if (random_->Chance(20)) {
+      code = Fit(Atom(ctx), kAssign);
+    } else {
+      code = std::string(random_->Pick(kCode));
+    }
+    return "eval(" + code + ")";
+  }
+  if (pick < 70 && !ctx.class_field) {
+    return random_->Chance(50) ? "arguments" : "arguments[0]";
+  }
+  // A class with a static block: a class scope inside the parameter scope.
+  GenContext block = ctx;
+  block.strict = true;
+  block.function = false;
+  block.async = false;
+  block.generator = false;
+  block.super_property = true;
+  block.super_call = false;
+  block.new_target = true;
+  block.class_field = true;
+  block.loop = false;
+  block.switch_stmt = false;
+  block.labels.clear();
+  block.loop_labels.clear();
+  block.ident_await_yield = false;
+  return "class { static " + Block(block, depth, 2) + " }";
+}
+
+Expr Generator::Cover(const GenContext& ctx, unsigned depth) {
+  // What an element (or a whole list) may become.
+  enum : unsigned { kPattern = 1, kExpression = 2, kTarget = 4, kAny = 7 };
+  struct Element {
+    std::string text;
+    unsigned ok = kAny;
+    bool name = false;  // `n` or `n = v`: usable as an object shorthand
+  };
+  // Defaults and nested values might end up in a parameter list, where
+  // await and yield are not allowed.
+  GenContext sub = ctx;
+  sub.async = false;
+  sub.generator = false;
+  sub.ident_await_yield = false;
+  const unsigned d = depth > 0 ? depth - 1 : 0;
+  std::vector<std::string> bound;
+  std::set<std::string> taken;
+  auto name = [&]() {
+    std::string n;
+    if (random_->Chance(40) && VisibleName(&n, false) && !IsContextual(n) &&
+        taken.insert(n).second) {
+      bound.push_back(n);
+      return n;
+    }
+    n = FreshName("c");
+    taken.insert(n);
+    bound.push_back(n);
+    return n;
+  };
+  auto value = [&]() { return Fit(ExpressionImpl(sub, d), kAssign); };
+  // `[...] = v`: a binding default, an assignment, or a target default.
+  auto with_default = [&](Element* e) {
+    if (!random_->Chance(30) || (e->ok & (kPattern | kTarget)) == 0) return;
+    e->text += " = " + value();
+    e->ok = (e->ok & kPattern) | ((e->ok & kTarget) ? kExpression | kTarget : 0);
+  };
+  auto element = [&](auto&& self, unsigned level) -> Element {
+    const unsigned pick = random_->Below(100);
+    Element e;
+    if (level == 0 || !Spend() || pick < 30) {
+      e.text = name();
+      e.name = true;
+      return e;
+    }
+    if (pick < 45) {
+      e.text = name() + " = " + value();
+      e.name = true;
+      return e;
+    }
+    if (pick < 60) {
+      std::vector<std::string> parts;
+      const unsigned count = random_->Below(4);
+      for (unsigned i = 0; i < count; ++i) {
+        if (random_->Chance(12)) {
+          parts.push_back("");
+          continue;
+        }
+        Element inner = self(self, level - 1);
+        e.ok &= inner.ok;
+        parts.push_back(inner.text);
+      }
+      if (random_->Chance(15)) {
+        parts.push_back("..." + name());
+      } else if (!parts.empty() && parts.back().empty()) {
+        parts.push_back(name());
+      }
+      e.text = "[" + Join(parts, ", ") + "]";
+      with_default(&e);
+      return e;
+    }
+    if (pick < 75) {
+      std::vector<std::string> parts;
+      const unsigned count = random_->Below(4);
+      for (unsigned i = 0; i < count; ++i) {
+        const unsigned kind = random_->Below(100);
+        if (kind < 35) {
+          parts.push_back(name());
+        } else if (kind < 50) {
+          // A shorthand initializer is only a pattern, never an object.
+          parts.push_back(name() + " = " + value());
+          e.ok &= kPattern | kTarget;
+        } else {
+          std::string key = random_->Chance(15)
+                                ? "[" + Fit(ExpressionImpl(sub, d), kAssign) + "]"
+                                : PropertyName();
+          Element inner = self(self, level - 1);
+          e.ok &= inner.ok;
+          parts.push_back(key + ": " + inner.text);
+        }
+      }
+      if (random_->Chance(12)) parts.push_back("..." + name());
+      e.text = "{" + Join(parts, ", ") + "}";
+      with_default(&e);
+      return e;
+    }
+    if (pick < 90) {
+      // Expression-only elements, some of which are assignment targets.
+      const unsigned kind = random_->Below(100);
+      if (kind < 45) {
+        // `[(x.y)] = z` is valid, but Tree-sitter rejects parenthesized
+        // targets, so a parenthesized member is an expression only.
+        e.text = Fit(Atom(sub), kLHS, kNumber | kOptional) + "." + PropertyName();
+        e.ok = kExpression | kTarget;
+        if (random_->Chance(30)) {
+          e.text = "(" + e.text + ")";
+          e.ok = kExpression;
+        }
+      } else if (kind < 75) {
+        e.text = Fit(Atom(sub), kLHS, kNumber) + "(" + ArgumentList(sub, d) + ")";
+        e.ok = kExpression;
+      } else {
+        e.text = random_->Chance(50) ? NumberLiteral(true) : StringLiteral(true);
+        e.ok = kExpression;
+      }
+      return e;
+    }
+    e.text = name();
+    e.name = true;
+    return e;
+  };
+
+  std::vector<Element> elements;
+  unsigned ok = kAny;
+  const unsigned count = random_->Below(random_->Chance(20) ? 6 : 4);
+  for (unsigned i = 0; i < count; ++i) {
+    elements.push_back(element(element, depth > 2 ? 2 : depth));
+    ok &= elements.back().ok;
+  }
+  std::string rest;
+  if (random_->Chance(15)) rest = "..." + name();
+
+  enum Finish { kArrowHead, kParenthesized, kDestructuring, kAsyncCall, kAsyncArrow };
+  std::vector<Finish> finishes;
+  if (ok & kPattern) {
+    finishes.push_back(kArrowHead);
+    finishes.push_back(kAsyncArrow);
+  }
+  if ((ok & kExpression) && rest.empty() && !elements.empty()) {
+    finishes.push_back(kParenthesized);
+  }
+  if (ok & kTarget) finishes.push_back(kDestructuring);
+  if (ok & kExpression) finishes.push_back(kAsyncCall);
+  if (finishes.empty()) return Atom(ctx);
+  const Finish finish = finishes[random_->Below(static_cast<uint32_t>(finishes.size()))];
+
+  std::vector<std::string> parts;
+  for (const Element& e : elements) parts.push_back(e.text);
+  auto list = [&](bool trailing_comma) {
+    std::vector<std::string> all = parts;
+    if (!rest.empty()) all.push_back(rest);
+    std::string out = Join(all, ", ");
+    if (trailing_comma && rest.empty() && !all.empty() && random_->Chance(10)) out += ",";
+    return out;
+  };
+
+  switch (finish) {
+    case kArrowHead:
+    case kAsyncArrow: {
+      const bool is_async = finish == kAsyncArrow;
+      const std::string head = "(" + list(true) + ")";
+      GenContext body = ctx;
+      body.function = true;
+      body.async = is_async;
+      body.generator = false;
+      body.loop = false;
+      body.switch_stmt = false;
+      body.labels.clear();
+      body.loop_labels.clear();
+      if (is_async) body.ident_await_yield = false;
+      PushScope();
+      for (const std::string& n : bound) Declare(n);
+      std::string text;
+      if (random_->Chance(40)) {
+        std::string statements = StatementList(body, d, 2, false, nullptr);
+        text = statements.empty() ? "{}" : "{\n" + statements + "\n}";
+      } else {
+        text = Fit(ExpressionImpl(body, d), kAssign);
+        if (text[0] == '{') text = "(" + text + ")";
+      }
+      PopScope();
+      return {std::string(is_async ? "async " : "") + head + " => " + text, kAssign, 0};
+    }
+    case kParenthesized:
+      return {"(" + list(false) + ")", kPrimary, 0};
+    case kDestructuring: {
+      const std::string right = Fit(ExpressionImpl(ctx, d), kAssign);
+      if (random_->Chance(50)) {
+        return {"[" + list(true) + "] = " + right, kAssign, 0};
+      }
+      std::vector<std::string> props;
+      for (const Element& e : elements) {
+        props.push_back(e.name && random_->Chance(70) ? e.text
+                                                      : PropertyName() + ": " + e.text);
+      }
+      if (!rest.empty()) props.push_back(rest);
+      return {"({" + Join(props, ", ") + "} = " + right + ")", kPrimary, 0};
+    }
+    default: {
+      // In sloppy script code `async(await, yield)` is a call; the same
+      // list before `=>` is an error V8 records while parsing the head.
+      std::string args = list(true);
+      if (ctx.ident_await_yield && !ctx.strict && !ctx.async && !ctx.generator &&
+          !ctx.class_field && random_->Chance(35)) {
+        static constexpr std::string_view kWords[] = {"await", "yield", "await, yield",
+                                                      "yield, await"};
+        const std::string words(random_->Pick(kWords));
+        args = args.empty() ? words : words + ", " + args;
+      }
+      return {"async(" + args + ")", kLHS, kCall};
+    }
+  }
+}
+
+Expr Generator::YieldTerminator(const GenContext& ctx, unsigned depth) {
+  switch (random_->Below(8)) {
+    case 0:
+      return {"[yield]", kPrimary, 0};
+    case 1:
+      return {"[" + Fit(ExpressionImpl(ctx, depth), kAssign) + ", yield]", kPrimary, 0};
+    case 2:
+      return {Fit(Atom(ctx), kLHS, kNumber) + "(yield)", kLHS, kCall};
+    case 3:
+      return {"{" + PropertyName() + ": yield}", kPrimary, 0};
+    case 4:
+      return {"(yield)", kPrimary, 0};
+    case 5:
+      return {Fit(ExpressionImpl(ctx, depth), kOr) + " ? yield : yield", kCond, 0};
+    case 6:
+      return {"yield, " + Fit(ExpressionImpl(ctx, depth), kAssign), kSeq, 0};
+    default:
+      return {"`${yield}`", kPrimary, 0};
+  }
+}
+
+Expr Generator::Chain(const GenContext& ctx, unsigned depth) {
+  Expr base = random_->Chance(70) ? Atom(ctx) : ExpressionImpl(ctx, depth);
+  std::string text = Fit(base, kLHS, kNumber);
+  const bool kept = text == base.text;
+  bool optional = kept && (base.flags & kOptional) != 0;
+  const unsigned import_call = kept ? (base.flags & kImportCall) : 0;
+  unsigned last = 0;
+  const unsigned links = 3 + random_->Below(4);
+  for (unsigned i = 0; i < links; ++i) {
+    const bool q = random_->Chance(30);
+    const unsigned pick = random_->Below(100);
+    if (pick < 30 || !Spend()) {
+      text += (q ? "?." : ".") + PropertyName();
+      last = 0;
+    } else if (pick < 45) {
+      text += std::string(q ? "?.[" : "[") + Fit(ExpressionImpl(ctx, depth), kSeq) + "]";
+      last = 0;
+    } else if (pick < 72) {
+      text += std::string(q ? "?.(" : "(") + ArgumentList(ctx, depth) + ")";
+      last = kCall;
+    } else if (pick < 82 && !ctx.private_names.empty()) {
+      text += (q ? "?." : ".") + ctx.private_names[random_->Below(
+                                     static_cast<uint32_t>(ctx.private_names.size()))];
+      last = kPrivate;
+    } else if (pick < 92 && !optional) {
+      // No template may follow `?.` anywhere in the chain. Tree-sitter
+      // rejects the escapes only tagged templates allow, so use plain text.
+      text += TemplateLiteral(ctx, depth, false);
+      last = 0;
+      continue;
+    } else {
+      text += "." + PropertyName();
+      last = 0;
+      continue;
+    }
+    if (q) optional = true;
+  }
+  return {text, kLHS, (optional ? kOptional : 0u) | last | import_call};
+}
+
+Expr Generator::ConditionalChain(const GenContext& ctx, unsigned depth) {
+  const unsigned arms = 3 + random_->Below(4);
+  std::string out;
+  for (unsigned i = 0; i + 1 < arms; ++i) {
+    std::string then;
+    if (random_->Chance(20)) {
+      then = Fit(ExpressionImpl(ctx, depth), kOr) + " ? " +
+             Fit(ExpressionImpl(ctx, depth), kAssign) + " : " +
+             Fit(ExpressionImpl(ctx, depth), kAssign);
+    } else {
+      then = Fit(ExpressionImpl(ctx, depth), kAssign);
+    }
+    out += Fit(ExpressionImpl(ctx, depth), kOr) + " ? " + then + " : ";
+  }
+  out += Fit(ExpressionImpl(ctx, depth), kAssign);
+  return {out, kCond, 0};
 }
 
 // ---------------------------------------------------------------------------
@@ -2864,6 +3239,7 @@ bool Generator::Program(std::string* out, unsigned depth,
     Reset();
     if (attempt != 0) nodes_left_ >>= attempt;
     GenContext ctx;
+    ctx.ident_await_yield = true;
     std::string text;
     if (random_->Chance(3)) text = "#!/usr/bin/env node\n";
     std::string list;

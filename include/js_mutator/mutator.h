@@ -31,6 +31,10 @@ enum class EditKind {
   kRebind,              // redeclare or shadow a visible name
   kMagicComment,        // rebuild //# sourceURL, debugId, compile-hint comments
   kRegexMalformed,      // malformed mode: a regexp syntax error or bad flags
+  kParamScope,          // move seed code into a parameter default
+  kUnwrap,              // replace an expression with one of its operands
+  kDeleteRange,         // delete 2-8 consecutive statements
+  kDeepen,              // nest an expression in many neutral wrappers
 };
 
 struct Config {
