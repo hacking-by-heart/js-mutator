@@ -131,15 +131,83 @@ bool NeedsStatementParens(std::string_view text) {
   if (StartsWithWord(text, "function") || StartsWithWord(text, "class")) {
     return true;
   }
-  if (StartsWithWord(text, "let")) {
-    size_t i = 3;
-    while (i < text.size() && (text[i] == ' ' || text[i] == '\n')) ++i;
-    if (i < text.size() && text[i] == '[') return true;
-  }
+  // `let` and `using` may start declarations; as identifiers they are
+  // always parenthesized at the start of a statement.
+  if (StartsWithWord(text, "let") || StartsWithWord(text, "using")) return true;
   if (StartsWithWord(text, "async")) {
     size_t i = 5;
     while (i < text.size() && text[i] == ' ') ++i;
     if (StartsWithWord(text.substr(i), "function")) return true;
+  }
+  return false;
+}
+
+std::string DecodeIdentifier(std::string_view text) {
+  if (text.find('\\') == std::string_view::npos) return std::string(text);
+  std::string out;
+  for (size_t i = 0; i < text.size(); ++i) {
+    if (text[i] != '\\' || i + 1 >= text.size() || text[i + 1] != 'u') {
+      out += text[i];
+      continue;
+    }
+    size_t j = i + 2;
+    uint32_t code = 0;
+    bool ok = true;
+    auto hex = [](char c) -> int {
+      if (c >= '0' && c <= '9') return c - '0';
+      if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+      if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+      return -1;
+    };
+    if (j < text.size() && text[j] == '{') {
+      ++j;
+      size_t digits = 0;
+      while (j < text.size() && text[j] != '}' && hex(text[j]) >= 0 && code <= 0x10FFFF) {
+        code = code * 16 + static_cast<uint32_t>(hex(text[j++]));
+        ++digits;
+      }
+      ok = digits > 0 && j < text.size() && text[j] == '}';
+    } else {
+      for (int k = 0; k < 4; ++k, ++j) {
+        if (j >= text.size() || hex(text[j]) < 0) {
+          ok = false;
+          break;
+        }
+        code = code * 16 + static_cast<uint32_t>(hex(text[j]));
+      }
+      --j;
+    }
+    if (!ok || code > 0x10FFFF) {
+      out += text[i];
+      continue;
+    }
+    // UTF-8, so decoded names compare equal to raw non-ASCII spellings.
+    if (code < 0x80) {
+      out += static_cast<char>(code);
+    } else if (code < 0x800) {
+      out += static_cast<char>(0xC0 | (code >> 6));
+      out += static_cast<char>(0x80 | (code & 0x3F));
+    } else if (code < 0x10000) {
+      out += static_cast<char>(0xE0 | (code >> 12));
+      out += static_cast<char>(0x80 | ((code >> 6) & 0x3F));
+      out += static_cast<char>(0x80 | (code & 0x3F));
+    } else {
+      out += static_cast<char>(0xF0 | (code >> 18));
+      out += static_cast<char>(0x80 | ((code >> 12) & 0x3F));
+      out += static_cast<char>(0x80 | ((code >> 6) & 0x3F));
+      out += static_cast<char>(0x80 | (code & 0x3F));
+    }
+    i = j;
+  }
+  return out;
+}
+
+bool IsStrictReservedWord(std::string_view name) {
+  static constexpr std::string_view kWords[] = {
+      "implements", "interface", "let", "package", "private", "protected",
+      "public", "static", "yield"};
+  for (std::string_view word : kWords) {
+    if (name == word) return true;
   }
   return false;
 }
@@ -166,6 +234,11 @@ Generator::Generator(Random* random, size_t limit, const SeedInfo& seed)
 
 void Generator::Reset() {
   scopes_.assign(1, {});
+  frames_.assign(1, {});
+  special_used_.clear();
+  no_special_ = 0;
+  bind_kind_ = BindKind::kNone;
+  plain_function_ = false;
   used_.clear();
   name_counter_ = 0;
   for (std::string_view keyword : kKeywords) used_.insert(std::string(keyword));
@@ -215,40 +288,195 @@ void Generator::Declare(const std::string& name) {
   scopes_.back().push_back(name);
 }
 
-void Generator::PushScope() { scopes_.emplace_back(); }
-
-void Generator::PopScope() {
-  if (scopes_.size() > 1) scopes_.pop_back();
+void Generator::PushScope() {
+  scopes_.emplace_back();
+  frames_.emplace_back();
 }
 
-bool Generator::VisibleName(std::string* out, bool reference) {
+void Generator::PopScope() {
+  if (scopes_.size() > 1) {
+    scopes_.pop_back();
+    frames_.pop_back();
+  }
+}
+
+bool Generator::VisibleName(std::string* out, bool reference,
+                            const GenContext* ctx) {
   size_t count = 0;
   for (const auto& scope : scopes_) count += scope.size();
   if (count == 0) return false;
-  size_t index = random_->Below(static_cast<uint32_t>(count));
-  for (const auto& scope : scopes_) {
-    if (index < scope.size()) {
-      *out = scope[index];
-      break;
+  auto at = [&](size_t index) -> const std::string& {
+    for (const auto& scope : scopes_) {
+      if (index < scope.size()) return scope[index];
+      index -= scope.size();
     }
-    index -= scope.size();
+    return scopes_.back().back();
+  };
+  // Scan forward from a random start for a name legal in this context.
+  const size_t start = random_->Below(static_cast<uint32_t>(count));
+  bool found = false;
+  for (size_t i = 0; i < count && !found; ++i) {
+    const std::string& name = at((start + i) % count);
+    if (special_used_.empty() || !IsSpecialName(name) ||
+        (ctx != nullptr && NameUsableIn(name, *ctx))) {
+      *out = name;
+      found = true;
+    }
+  }
+  if (!found) return false;
+  if (IsSpecialName(*out)) {
+    // Tree-sitter reads a bare `yield` or `await` as an operator.
+    if (reference && (*out == "yield" || *out == "await")) *out = "(" + *out + ")";
+    return true;
   }
   // An escaped identifier names the same binding: abc is abc.
   if (reference && !out->empty() && !IsContextual(*out) && random_->Chance(4)) {
-    const char first = (*out)[0];
-    if ((first >= 'a' && first <= 'z') || (first >= 'A' && first <= 'Z')) {
-      static const char kHex[] = "0123456789abcdef";
-      std::string escaped = "\\u00";
-      escaped += kHex[(first >> 4) & 0xf];
-      escaped += kHex[first & 0xf];
-      *out = escaped + out->substr(1);
-    }
+    *out = EscapeIdent(*out);
   }
   return true;
 }
 
-bool Generator::AssignableName(std::string* out) {
-  return VisibleName(out, true);
+bool Generator::AssignableName(std::string* out, const GenContext* ctx) {
+  // `(yield) = x` is valid sloppy code, but Tree-sitter cannot parse it.
+  for (unsigned tries = 0; tries < 3; ++tries) {
+    if (!VisibleName(out, true, ctx)) return false;
+    if (*out != "(yield)") return true;
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// Binding names.
+
+bool IsSpecialName(std::string_view name) {
+  static constexpr std::string_view kNames[] = {
+      "await", "yield", "let", "static", "implements", "interface", "package",
+      "private", "protected", "public", "eval", "arguments"};
+  for (std::string_view special : kNames) {
+    if (name == special) return true;
+  }
+  return false;
+}
+
+bool Generator::SpecialNamesAllowed(const GenContext& ctx) const {
+  return !ctx.strict && !ctx.async && !ctx.generator && !ctx.class_field &&
+         no_special_ == 0;
+}
+
+bool Generator::NameUsableIn(const std::string& name, const GenContext& ctx) const {
+  return !IsSpecialName(name) || SpecialNamesAllowed(ctx);
+}
+
+std::string Generator::EscapeIdent(const std::string& name) {
+  if (name.empty() || name.find('\\') != std::string::npos) return name;
+  // Any position may be escaped, as long as the escape decodes to an
+  // identifier character (a leading digit never occurs in our names).
+  const size_t i = random_->Below(static_cast<uint32_t>(name.size()));
+  const unsigned char c = static_cast<unsigned char>(name[i]);
+  static const char kHex[] = "0123456789abcdef";
+  std::string hex;
+  hex += kHex[(c >> 4) & 0xf];
+  hex += kHex[c & 0xf];
+  std::string escape;
+  if (random_->Chance(60)) {
+    escape = "\\u00" + hex;
+  } else {
+    // \u{...} allows any number of leading zeros.
+    escape = "\\u{" + std::string(random_->Below(4), '0') +
+             (hex[0] == '0' ? hex.substr(1) : hex) + "}";
+  }
+  return name.substr(0, i) + escape + name.substr(i + 1);
+}
+
+// Names already bound in the innermost frame: parameters and earlier
+// declarations of this list. A duplicate means colliding parameters.
+bool Generator::FrameHasSpecialOrDuplicate() const {
+  const auto& names = scopes_.back();
+  for (size_t i = 0; i < names.size(); ++i) {
+    if (IsSpecialName(names[i])) return true;
+    for (size_t j = 0; j < i; ++j) {
+      if (names[j] == names[i]) return true;
+    }
+  }
+  return false;
+}
+
+// A name from an enclosing frame, so the new binding shadows it. Lexical
+// names never come from the innermost frame (a redeclaration) or, in a catch
+// body, from the catch parameter. Var names hoist to the function, so they
+// only come from outside it and never collide with a lexical name inside.
+bool Generator::ReuseName(const GenContext& ctx, BindKind kind, std::string* out) {
+  const size_t n = scopes_.size();
+  if (n < 2) return false;
+  size_t fn = n;
+  for (size_t i = n; i-- > 0;) {
+    if (frames_[i].function) {
+      fn = i;
+      break;
+    }
+  }
+  if (kind == BindKind::kVar && fn == n) return false;
+  const size_t limit = kind == BindKind::kVar ? fn : n - 1;
+  const bool catch_body = n >= 2 && frames_[n - 2].catch_param;
+  auto in = [](const std::vector<std::string>& list, const std::string& name) {
+    return std::find(list.begin(), list.end(), name) != list.end();
+  };
+  std::vector<const std::string*> candidates;
+  for (size_t i = 0; i < limit; ++i) {
+    if (catch_body && i == n - 2 && kind != BindKind::kVar) continue;
+    for (const std::string& name : scopes_[i]) {
+      if (IsSpecialName(name) || !NameUsableIn(name, ctx)) continue;
+      if (avoid_contextual_ && IsContextual(name)) continue;
+      if (in(scopes_[n - 1], name)) continue;
+      if (in(frames_[n - 1].var_blocked, name)) continue;
+      if (kind == BindKind::kVar) {
+        bool inside = false;
+        for (size_t j = fn; j < n && !inside; ++j) inside = in(scopes_[j], name);
+        if (inside) continue;
+      }
+      candidates.push_back(&name);
+      if (candidates.size() >= 64) break;
+    }
+  }
+  if (candidates.empty()) return false;
+  *out = *candidates[random_->Below(static_cast<uint32_t>(candidates.size()))];
+  if (kind == BindKind::kVar) {
+    for (size_t j = fn; j < n; ++j) frames_[j].var_blocked.push_back(*out);
+  }
+  return true;
+}
+
+std::string Generator::BindingName(const GenContext& ctx, BindKind kind,
+                                   std::string_view prefix) {
+  if (kind == BindKind::kNone) return FreshName(prefix);
+  if (!avoid_contextual_ && SpecialNamesAllowed(ctx) && random_->Chance(5)) {
+    static constexpr std::string_view kPool[] = {
+        "await", "yield", "let", "static", "implements", "interface", "package",
+        "private", "protected", "public", "eval", "arguments"};
+    const std::string name(random_->Pick(kPool));
+    // `let` is never a lexical name (a destructured catch parameter is
+    // lexical); Tree-sitter cannot parse a parameter or catch parameter named
+    // `yield`.
+    const bool legal = !(name == "let" && (kind == BindKind::kLexical ||
+                                           kind == BindKind::kCatch)) &&
+                       !(name == "yield" && (kind == BindKind::kParam ||
+                                             kind == BindKind::kCatch));
+    if (legal && special_used_.count(name) == 0 &&
+        std::find(seed_.reserved.begin(), seed_.reserved.end(), name) ==
+            seed_.reserved.end()) {
+      special_used_.insert(name);
+      return name;
+    }
+  }
+  std::string reused;
+  if (random_->Chance(30) && ReuseName(ctx, kind, &reused)) {
+    // Declared at once, so a second name in the same declaration differs.
+    Declare(reused);
+    return reused;
+  }
+  std::string name = FreshName(prefix);
+  if (random_->Chance(3) && !IsContextual(name)) return EscapeIdent(name);
+  return name;
 }
 
 // ---------------------------------------------------------------------------
@@ -490,7 +718,7 @@ std::string Generator::BindingPattern(const GenContext& ctx, unsigned depth,
     return " = " + Fit(ExpressionImpl(ctx, depth > 0 ? depth - 1 : 0), kAssign);
   };
   if (!allow_pattern || depth == 0 || !Spend()) {
-    std::string name = FreshName("v");
+    std::string name = BindingName(ctx, bind_kind_, "v");
     names->push_back(name);
     return name;
   }
@@ -500,7 +728,7 @@ std::string Generator::BindingPattern(const GenContext& ctx, unsigned depth,
     for (unsigned i = 0; i < count; ++i) {
       const unsigned pick = random_->Below(100);
       if (pick < 40) {
-        std::string name = FreshName("v");
+        std::string name = BindingName(ctx, bind_kind_, "v");
         names->push_back(name);
         parts.push_back(random_->Chance(30) ? name + default_value() : name);
       } else {
@@ -518,7 +746,7 @@ std::string Generator::BindingPattern(const GenContext& ctx, unsigned depth,
       }
     }
     if (random_->Chance(15)) {
-      std::string name = FreshName("r");
+      std::string name = BindingName(ctx, bind_kind_, "r");
       names->push_back(name);
       parts.push_back("..." + name);
     }
@@ -547,11 +775,13 @@ std::string Generator::Parameters(const GenContext& ctx, unsigned depth,
   const unsigned count =
       min_count + random_->Below(max_count - min_count + 1);
   std::vector<std::string> parts;
+  const BindKind saved_kind = bind_kind_;
   for (unsigned i = 0; i < count; ++i) {
     std::vector<std::string> names;
     std::string param;
+    bind_kind_ = BindKind::kParam;
     if (simple) {
-      param = FreshName("p");
+      param = BindingName(ctx, BindKind::kParam, "p");
       names.push_back(param);
     } else {
       param = BindingPattern(ctx, depth, random_->Chance(30), &names);
@@ -578,11 +808,15 @@ std::string Generator::Parameters(const GenContext& ctx, unsigned depth,
     for (const std::string& name : names) Declare(name);
     parts.push_back(param);
   }
-  if (!simple && allow_rest && random_->Chance(15)) {
+  const bool rest = !simple && allow_rest && random_->Chance(15);
+  if (rest) {
     std::vector<std::string> names;
+    bind_kind_ = BindKind::kParam;
     parts.push_back("..." + BindingPattern(ctx, depth, random_->Chance(25), &names));
     for (const std::string& name : names) Declare(name);
-  } else if (allow_rest && !parts.empty() && random_->Chance(5)) {
+  }
+  bind_kind_ = saved_kind;
+  if (!rest && allow_rest && !parts.empty() && random_->Chance(5)) {
     // Setters, the only callers without rest, do not allow a trailing comma.
     return Join(parts, ", ") + ",";
   }
@@ -599,9 +833,11 @@ std::string Generator::VariableDeclaration(const GenContext& ctx, unsigned depth
   const unsigned count = for_head ? 1 + random_->Below(2) : 1 + (random_->Chance(20) ? random_->Below(2) + 1 : 0);
   std::vector<std::string> parts;
   std::vector<std::string> declared;
+  const BindKind saved_kind = bind_kind_;
   for (unsigned i = 0; i < count; ++i) {
     std::vector<std::string> names;
     const bool pattern = random_->Chance(22);
+    bind_kind_ = kind == "var" ? BindKind::kVar : BindKind::kLexical;
     std::string binding = BindingPattern(ctx, depth, pattern, &names);
     const bool needs_init = kind == "const" || binding[0] == '{' || binding[0] == '[';
     if (needs_init || random_->Chance(70)) {
@@ -612,6 +848,7 @@ std::string Generator::VariableDeclaration(const GenContext& ctx, unsigned depth
     parts.push_back(binding);
     declared.insert(declared.end(), names.begin(), names.end());
   }
+  bind_kind_ = saved_kind;
   for (const std::string& name : declared) Declare(name);
   return kind + " " + Join(parts, ", ");
 }
@@ -652,12 +889,19 @@ std::string Generator::ForInOfStatement(const GenContext& ctx, unsigned depth) {
     std::string name = FreshName("v");
     names.push_back(name);
     head = "var " + name + " = " + Fit(ExpressionImpl(ctx, depth > 0 ? depth - 1 : 0), kBitOr);
+  } else if (pick >= 80 && pick < 88) {
+    // Parenthesized and (sloppy) call targets.
+    head = !ctx.strict && random_->Chance(30) ? "(" + CallTarget(ctx, depth) + ")"
+                                              : ParenthesizedTarget(ctx, depth);
   } else if (pick < 80 || !VisibleName(&target, false) || IsContextual(target)) {
     const unsigned kind = random_->Below(3);
     // `for (let of ...)` and similar spellings are ambiguous; avoid
     // contextual keywords as loop heads.
     avoid_contextual_ = true;
+    const BindKind saved_kind = bind_kind_;
+    bind_kind_ = kind == 0 ? BindKind::kVar : BindKind::kLexical;
     std::string binding = BindingPattern(ctx, depth, random_->Chance(25), &names);
+    bind_kind_ = saved_kind;
     avoid_contextual_ = false;
     head = std::string(kind == 0 ? "var " : kind == 1 ? "let " : "const ") + binding;
   } else {
@@ -704,8 +948,12 @@ std::string Generator::TryStatement(const GenContext& ctx, unsigned depth) {
     if (pick < 20) {
       out += " catch ";
     } else {
+      frames_.back().catch_param = true;
       std::vector<std::string> names;
+      const BindKind saved_kind = bind_kind_;
+      bind_kind_ = BindKind::kCatch;
       std::string param = BindingPattern(ctx, depth, pick > 80, &names);
+      bind_kind_ = saved_kind;
       for (const std::string& name : names) Declare(name);
       out += " catch (" + param + ") ";
     }
@@ -765,7 +1013,7 @@ std::string Generator::StatementImpl(const GenContext& ctx, unsigned depth,
   enum Kind {
     kExpr, kVar, kIf, kFor, kForInOf, kWhile, kDo, kBlock, kLabel, kFunc,
     kClass, kTry, kSwitch, kReturn, kThrow, kJump, kWith, kDebugger,
-    kEmpty, kAnnexBFunction, kCount
+    kEmpty, kAnnexBFunction, kAnnexBShape, kSpecialForm, kCount
   };
   unsigned weights[kCount] = {};
   weights[kExpr] = 14;
@@ -788,6 +1036,8 @@ std::string Generator::StatementImpl(const GenContext& ctx, unsigned depth,
   weights[kDebugger] = 1;
   weights[kEmpty] = 1;
   weights[kAnnexBFunction] = (pos == Pos::kIfBody && !ctx.strict) ? 6 : 0;
+  weights[kAnnexBShape] = (list && !ctx.strict) ? 3 : 0;
+  weights[kSpecialForm] = SpecialNamesAllowed(ctx) ? 3 : 0;
   unsigned total = 0;
   for (unsigned w : weights) total += w;
   unsigned roll = random_->Below(total);
@@ -869,9 +1119,139 @@ std::string Generator::StatementImpl(const GenContext& ctx, unsigned depth,
              SubStatement(ctx, d, Pos::kSub);
     case kDebugger:
       return "debugger;";
+    case kAnnexBShape:
+      return AnnexBStatement(ctx, d);
+    case kSpecialForm:
+      return SpecialFormStatement(ctx, d, list);
     default:
       return ";";
   }
+}
+
+// Sloppy-mode function declarations in blocks, if bodies, labels, and switch
+// cases (Annex B.3.3), often named like an outer let, parameter, or catch
+// parameter, so hoisting has to decide whether a var binding is created.
+std::string Generator::AnnexBStatement(const GenContext& ctx, unsigned depth) {
+  GenContext body = ctx;
+  body.async = false;
+  body.generator = false;
+  body.super_property = false;
+  body.super_call = false;
+  body.new_target = true;
+  body.class_field = false;
+  // Pushes a scope for the function's block unless `here`.
+  auto function = [&](bool here) {
+    if (!here) PushScope();
+    std::string name;
+    if (!random_->Chance(70) || !ReuseName(ctx, BindKind::kLexical, &name)) {
+      name = FreshName("f");
+    }
+    Declare(name);
+    plain_function_ = true;
+    std::string text = "function " + name + " " +
+                       FunctionTail(ctx, depth, body, 0, 3, true, {}, false);
+    if (!here) PopScope();
+    return text;
+  };
+  auto condition = [&]() { return Fit(ExpressionImpl(ctx, depth), kSeq); };
+  switch (random_->Below(5)) {
+    case 0:
+      return "{\n" + function(false) + "\n}";
+    case 1: {
+      std::string out = "if (" + condition() + ") " + function(false);
+      if (random_->Chance(30)) out += " else " + function(false);
+      return out;
+    }
+    case 2:
+      // A labelled function declares in the enclosing scope.
+      return FreshName("L") + ": " + function(true);
+    case 3: {
+      std::string discriminant = condition();
+      return "switch (" + discriminant + ") {\ncase " + condition() + ":\n" +
+             function(false) + "\n}";
+    }
+    default:
+      return FreshName("L") + ": {\n" + function(false) + "\n}";
+  }
+}
+
+// Contextual keywords used as identifiers (sloppy, not async or generator).
+std::string Generator::SpecialFormStatement(const GenContext& ctx, unsigned depth,
+                                            bool list) {
+  auto expression = [&]() { return Fit(ExpressionImpl(ctx, depth), kAssign); };
+  std::string name;
+  const unsigned pick = random_->Below(list ? 7 : 3);
+  switch (pick) {
+    case 0: {
+      // `await` is a plain label outside async functions and modules.
+      if (std::find(ctx.labels.begin(), ctx.labels.end(), "await") != ctx.labels.end()) {
+        break;
+      }
+      GenContext inner = ctx;
+      inner.labels.push_back("await");
+      return "await: " + Block(inner, depth, 2);
+    }
+    case 1:
+      // `let[` always starts a declaration; parenthesized it is a name.
+      return "(let)[" + Fit(ExpressionImpl(ctx, depth), kSeq) + "] = " + expression() + ";";
+    case 2: {
+      static constexpr std::string_view kWords[] = {"await", "yield", "let", "static"};
+      std::vector<std::string> parts;
+      for (std::string_view word : kWords) {
+        if (random_->Chance(60)) parts.emplace_back(word);
+      }
+      if (parts.empty()) parts.emplace_back("let");
+      return "({" + Join(parts, ", ") + "});";
+    }
+    case 3:
+      // A substatement cannot be a declaration, so `let` is an expression
+      // statement and ASI ends it at the line break.
+      if (AssignableName(&name, &ctx) && !IsSpecialName(name) && name[0] != '(' &&
+          !IsContextual(name)) {
+        return "if (" + Fit(ExpressionImpl(ctx, depth), kSeq) + ") let\n" + name +
+               " = " + expression() + ";";
+      }
+      break;
+    case 4: {
+      // In a statement list `let` + newline + name is a declaration.
+      std::string init = expression();
+      name = FreshName("v");
+      Declare(name);
+      return "let\n" + name + " = " + init + ";";
+    }
+    default:
+      // Not `using` declarations: a line break, or `[`, follows `using`.
+      // (Tree-sitter only parses a plain name inside `using[...]`.)
+      if (VisibleName(&name, false, &ctx) && !IsSpecialName(name) && !IsContextual(name)) {
+        return pick == 5 ? "using\n" + name + ";" : "using[" + name + "];";
+      }
+      break;
+  }
+  return "(let)[0] = " + expression() + ";";
+}
+
+std::string Generator::CallTarget(const GenContext& ctx, unsigned depth) {
+  Expr callee = ExpressionImpl(ctx, depth);
+  std::string text = Fit(callee, kLHS, kOptional | kNumber);
+  if (IsContextual(text) || IsSpecialName(text)) text = "(" + text + ")";
+  return text + "(" + ArgumentList(ctx, depth) + ")";
+}
+
+std::string Generator::ParenthesizedTarget(const GenContext& ctx, unsigned depth) {
+  std::string target;
+  if (!random_->Chance(50) || !AssignableName(&target, &ctx) || IsSpecialName(target) ||
+      target[0] == '(' || IsContextual(target)) {
+    Expr object = ExpressionImpl(ctx, depth);
+    target = Fit(object, kLHS, kNumber | kOptional);
+    if (random_->Chance(50)) {
+      target += "." + PropertyName();
+    } else {
+      target += "[" + Fit(ExpressionImpl(ctx, depth), kSeq) + "]";
+    }
+  }
+  target = "(" + target + ")";
+  if (random_->Chance(25)) target = "(" + target + ")";
+  return target;
 }
 
 // ---------------------------------------------------------------------------
@@ -883,6 +1263,8 @@ std::string Generator::FunctionTail(const GenContext& outer, unsigned depth,
                                     const std::vector<std::string>& extra_names,
                                     bool prepend_super_call) {
   (void)outer;
+  const bool plain = plain_function_;
+  plain_function_ = false;
   body_ctx.function = true;
   body_ctx.loop = false;
   body_ctx.switch_stmt = false;
@@ -894,12 +1276,41 @@ std::string Generator::FunctionTail(const GenContext& outer, unsigned depth,
   param_ctx.generator = false;
 
   PushScope();
+  frames_.back().function = true;
   for (const std::string& name : extra_names) Declare(name);
   const bool simple = random_->Chance(40);
+  // `await` and `yield` are reserved in the parameters of async functions
+  // and generators even though expressions there are neither.
+  const bool reserved_params = body_ctx.async || body_ctx.generator;
+  if (reserved_params) ++no_special_;
   std::string params =
       Parameters(param_ctx, depth, simple, param_min, param_max, allow_rest);
-  // "use strict" is only allowed in a function with simple parameters.
-  std::string list = StatementList(body_ctx, depth, 3, simple, nullptr);
+  if (reserved_params) --no_special_;
+  const size_t first_param = extra_names.size();
+  const std::vector<std::string> param_names(
+      scopes_.back().begin() + static_cast<long>(std::min(first_param, scopes_.back().size())),
+      scopes_.back().end());
+  // Colliding parameters: sloppy plain functions with simple lists only.
+  if (plain && simple && !body_ctx.strict && !body_ctx.class_field &&
+      !param_names.empty() && random_->Chance(10)) {
+    const std::string& again =
+        param_names[random_->Below(static_cast<uint32_t>(param_names.size()))];
+    params += (params.back() == ',' ? " " : ", ") + again;
+    Declare(again);
+  }
+  // A body var redeclaring a parameter of a non-simple list gets its own
+  // binding, initialized from the parameter.
+  std::string shadow;
+  if (!simple && !param_names.empty() && random_->Chance(15)) {
+    shadow = "var " + param_names[random_->Below(static_cast<uint32_t>(param_names.size()))];
+    if (random_->Chance(50)) shadow += " = " + Fit(ExpressionImpl(body_ctx, depth > 0 ? depth - 1 : 0), kAssign);
+    shadow += ";";
+  }
+  // "use strict" is only allowed in a function with simple parameters, none
+  // of them repeated or named eval, arguments, or a strict reserved word.
+  const bool prologue = simple && !FrameHasSpecialOrDuplicate();
+  std::string list = StatementList(body_ctx, depth, 3, prologue, nullptr);
+  if (!shadow.empty()) list = list.empty() ? shadow : shadow + "\n" + list;
   PopScope();
   std::string body;
   if (prepend_super_call) {
@@ -933,6 +1344,7 @@ std::string Generator::FunctionExpressionOrDeclaration(
   if (!declaration && !name.empty()) extra.push_back(name);
   std::string text = std::string(is_async ? "async " : "") + "function" +
                      (is_generator ? "*" : "") + (name.empty() ? "" : " " + name);
+  plain_function_ = true;
   return text + " " + FunctionTail(ctx, depth, body, 0, 3, true, extra, false);
 }
 
@@ -950,26 +1362,32 @@ std::string Generator::ArrowFunction(const GenContext& ctx, unsigned depth) {
   param_ctx.async = false;
 
   PushScope();
+  frames_.back().function = true;
+  // Inside async code and generators, keep await/yield names out of arrows.
+  const bool reserved = is_async || ctx.async || ctx.generator;
+  if (reserved) ++no_special_;
   std::string params;
   bool simple = true;
   if (random_->Chance(25)) {
     avoid_contextual_ = is_async;  // keep `async async => x` out
-    std::string name = FreshName("a");
+    std::string name = BindingName(param_ctx, BindKind::kParam, "a");
     avoid_contextual_ = false;
     Declare(name);
-    params = name;
+    params = IsSpecialName(name) ? "(" + name + ")" : name;
   } else {
     simple = random_->Chance(45);
     params = "(" + Parameters(param_ctx, depth, simple, 0, 3, true) + ")";
   }
   std::string text;
   if (random_->Chance(50)) {
-    std::string list = StatementList(body, depth, 3, simple, nullptr);
+    std::string list = StatementList(body, depth, 3, simple && !FrameHasSpecialOrDuplicate(),
+                                     nullptr);
     text = list.empty() ? "{}" : "{\n" + list + "\n}";
   } else {
     text = Fit(ExpressionImpl(body, depth), kAssign);
     if (text[0] == '{') text = "(" + text + ")";
   }
+  if (reserved) --no_special_;
   PopScope();
   return std::string(is_async ? "async " : "") + params + " => " + text;
 }
@@ -1150,6 +1568,25 @@ std::string Generator::ClassText(const GenContext& ctx, unsigned depth,
       members.push_back(";");
     }
   }
+  // Contextual keywords as member names: `get;`, `static(){}`,
+  // `static static(){}`, `async = 1;`, `get set(){}`, `accessor;`.
+  if (random_->Chance(12)) {
+    static constexpr std::string_view kNames[] = {"get", "set", "static", "async",
+                                                  "accessor"};
+    const std::string member_name(random_->Pick(kNames));
+    const bool is_static = random_->Chance(30);
+    switch (random_->Below(3)) {
+      case 0:
+        emit_field(member_name, is_static);
+        break;
+      case 1:
+        emit_method(member_name, is_static, 0);
+        break;
+      default:
+        emit_method(member_name, is_static, 1 + random_->Below(2));
+        break;
+    }
+  }
   // Shuffle members so private declarations are not always first.
   for (size_t n = members.size(); n > 1; --n) {
     std::swap(members[n - 1], members[random_->Below(static_cast<uint32_t>(n))]);
@@ -1160,6 +1597,33 @@ std::string Generator::ClassText(const GenContext& ctx, unsigned depth,
   if (!name.empty()) text += " " + name;
   if (derived) text += " extends " + heritage;
   if (members.empty()) return text + " {}";
+  // Automatic semicolon insertion between a field and a member that cannot
+  // continue it. Fields named by contextual keywords keep their semicolon
+  // (`get\nx(){}` is a getter).
+  for (size_t i = 0; i + 1 < members.size(); ++i) {
+    std::string& member = members[i];
+    if (member.size() < 2 || member.back() != ';' || !random_->Chance(30)) continue;
+    std::string_view head = member;
+    if (StartsWithWord(head, "static")) {
+      head.remove_prefix(6);
+      while (!head.empty() && head[0] == ' ') head.remove_prefix(1);
+      // `static;` and `static = 1;` are fields named static.
+      if (head.empty() || head[0] == ';' || head[0] == '=') continue;
+    }
+    bool contextual = false;
+    for (std::string_view word : {"get", "set", "static", "async", "accessor"}) {
+      if (StartsWithWord(head, word)) contextual = true;
+    }
+    const std::string& next = members[i + 1];
+    const char c = next.empty() ? '\0' : next[0];
+    const bool name_start = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' ||
+                            c == '$' || c == '#';
+    if (contextual || !name_start || StartsWithWord(next, "in") ||
+        StartsWithWord(next, "instanceof")) {
+      continue;
+    }
+    member.pop_back();
+  }
   return text + " {\n" + Join(members, "\n") + "\n}";
 }
 
@@ -1190,7 +1654,7 @@ std::string Generator::ObjectLiteral(const GenContext& ctx, unsigned depth) {
     std::string name;
     if (pick < 35) {
       parts.push_back(key() + ": " + Fit(ExpressionImpl(ctx, depth), kAssign));
-    } else if (pick < 48 && VisibleName(&name, false)) {
+    } else if (pick < 48 && VisibleName(&name, false, &ctx)) {
       parts.push_back(name);
     } else if (pick < 63) {
       const bool is_async = random_->Chance(22);
@@ -1239,7 +1703,7 @@ Expr Generator::Atom(const GenContext& ctx) {
   if (ctx.class_field && random_->Chance(25)) return {"this", kPrimary, 0};
   const unsigned pick = random_->Below(100);
   std::string name;
-  if (pick < 28 && VisibleName(&name, true)) return {name, kPrimary, 0};
+  if (pick < 28 && VisibleName(&name, true, &ctx)) return {name, kPrimary, 0};
   if (pick < 36 && !seed_.expressions.empty()) {
     return {"(" + seed_.expressions[random_->Below(
                       static_cast<uint32_t>(seed_.expressions.size()))] + ")",
@@ -1332,11 +1796,15 @@ Expr Generator::Unary(const GenContext& ctx, unsigned depth) {
   }
   if (pick < 30) {
     std::string target;
-    if (random_->Chance(60) && AssignableName(&target)) {
+    if (!ctx.strict && random_->Chance(6)) {
+      // Annex B: a call is a valid update target in sloppy code.
+      target = CallTarget(ctx, depth);
+    } else if (random_->Chance(60) && AssignableName(&target, &ctx)) {
     } else {
       Expr object = ExpressionImpl(ctx, depth);
       target = Fit(object, kLHS, kNumber | kOptional) + "." + PropertyName();
     }
+    if (random_->Chance(8)) target = "(" + target + ")";
     const std::string op = random_->Chance(50) ? "++" : "--";
     if (random_->Chance(50)) return {op + target, kUpdate, 0};
     return {target + op, kUpdate, 0};
@@ -1377,7 +1845,7 @@ Expr Generator::Assignment(const GenContext& ctx, unsigned depth) {
   };
   auto simple_target = [&]() {
     std::string name;
-    if (random_->Chance(70) && AssignableName(&name)) return name;
+    if (random_->Chance(70) && AssignableName(&name, &ctx)) return name;
     return member_target();
   };
   if (op == "=" && pick < 15 && depth > 0) {
@@ -1410,7 +1878,16 @@ Expr Generator::Assignment(const GenContext& ctx, unsigned depth) {
     }
     target = object ? "{" + Join(parts, ", ") + "}" : "[" + Join(parts, ", ") + "]";
   } else {
-    target = simple_target();
+    const bool logical = op == "&&=" || op == "||=" || op == "?\?=";
+    if (!ctx.strict && !logical && random_->Chance(6)) {
+      // Annex B: `(f()) = x` throws at run time in sloppy code. Tree-sitter
+      // needs the parentheses.
+      target = "(" + CallTarget(ctx, depth) + ")";
+    } else if (random_->Chance(8)) {
+      target = ParenthesizedTarget(ctx, depth);
+    } else {
+      target = simple_target();
+    }
   }
   return {target + " " + std::string(op) + " " +
               Fit(ExpressionImpl(ctx, depth), kAssign),

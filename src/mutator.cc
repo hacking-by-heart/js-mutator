@@ -20,8 +20,11 @@
 namespace js_mutator {
 namespace {
 
+using internal::DecodeIdentifier;
 using internal::GenContext;
 using internal::Generator;
+using internal::IsSpecialName;
+using internal::IsStrictReservedWord;
 using internal::NeedsStatementParens;
 using internal::Random;
 using internal::SeedInfo;
@@ -477,7 +480,12 @@ void CollectAllNames(TSNode root, std::string_view source,
     if (!IsIdentifierLike(ts_node_type(node))) return true;
     std::string name(NodeText(node, source));
     if (!name.empty() && name[0] == '#') name.erase(0, 1);
+    // An escaped spelling also reserves the name it decodes to.
+    std::string decoded = DecodeIdentifier(name);
     if (!name.empty() && seen.insert(name).second) reserved->push_back(std::move(name));
+    if (!decoded.empty() && seen.insert(decoded).second) {
+      reserved->push_back(std::move(decoded));
+    }
     return true;
   });
 }
@@ -506,14 +514,178 @@ bool HasLegacySyntax(TSNode node, std::string_view source) {
   return false;
 }
 
-// Code that is only legal in sloppy mode.
-bool HasSloppyOnly(TSNode root, std::string_view source, Budget* budget) {
+// ---------------------------------------------------------------------------
+// Names and assignment targets.
+
+bool IsIdentifierNode(TSNode node) {
+  return Is(node, "identifier") || Is(node, "shorthand_property_identifier") ||
+         Is(node, "shorthand_property_identifier_pattern");
+}
+
+bool IsEvalOrArguments(std::string_view name) {
+  return name == "eval" || name == "arguments";
+}
+
+// Reserved words that are never identifiers, escaped or not.
+bool IsAlwaysReservedWord(std::string_view name) {
+  static constexpr std::string_view kWords[] = {
+      "break", "case", "catch", "class", "const", "continue", "debugger",
+      "default", "delete", "do", "else", "enum", "export", "extends", "false",
+      "finally", "for", "function", "if", "import", "in", "instanceof", "new",
+      "null", "return", "super", "switch", "this", "throw", "true", "try",
+      "typeof", "var", "void", "while", "with"};
+  for (std::string_view word : kWords) {
+    if (name == word) return true;
+  }
+  return false;
+}
+
+TSNode SkipParens(TSNode node) {
+  while (Is(node, "parenthesized_expression") && ts_node_named_child_count(node) == 1) {
+    node = ts_node_named_child(node, 0);
+  }
+  return node;
+}
+
+// Whether an identifier node is bound or assigned (not merely read).
+bool IsBindingOrTarget(TSNode id) {
+  if (Is(id, "shorthand_property_identifier_pattern")) return true;
+  TSNode child = id;
+  TSNode p = ts_node_parent(id);
+  while (Is(p, "parenthesized_expression")) {
+    child = p;
+    p = ts_node_parent(p);
+  }
+  if (ts_node_is_null(p)) return false;
+  auto field_is = [&](const char* name) { return ts_node_eq(child, Field(p, name)); };
+  const char* type = ts_node_type(p);
+  if (std::strcmp(type, "formal_parameters") == 0 || std::strcmp(type, "array_pattern") == 0 ||
+      std::strcmp(type, "rest_pattern") == 0 || std::strcmp(type, "object_pattern") == 0 ||
+      std::strcmp(type, "update_expression") == 0) {
+    return true;
+  }
+  if (std::strcmp(type, "variable_declarator") == 0 || IsFunctionType(type) ||
+      std::strcmp(type, "class") == 0 || std::strcmp(type, "class_declaration") == 0) {
+    return field_is("name");
+  }
+  if (std::strcmp(type, "assignment_pattern") == 0 ||
+      std::strcmp(type, "object_assignment_pattern") == 0 ||
+      std::strcmp(type, "assignment_expression") == 0 ||
+      std::strcmp(type, "augmented_assignment_expression") == 0 ||
+      std::strcmp(type, "for_in_statement") == 0) {
+    return field_is("left");
+  }
+  if (std::strcmp(type, "pair_pattern") == 0) return field_is("value");
+  if (std::strcmp(type, "catch_clause") == 0) return field_is("parameter");
+  if (std::strcmp(type, "arrow_function") == 0) return field_is("parameter");
+  return false;
+}
+
+// A function call used as an assignment target: a runtime error in sloppy
+// code (Annex B), an early error everywhere else.
+bool IsCallTarget(TSNode target) {
+  TSNode inner = SkipParens(target);
+  return Is(inner, "call_expression");
+}
+
+bool IsGeneratorFunction(TSNode node) {
+  const char* type = ts_node_type(node);
+  return std::strstr(type, "generator") != nullptr ||
+         (std::strcmp(type, "method_definition") == 0 && HasDirectToken(node, "*"));
+}
+
+bool IsAsyncFunction(TSNode node) {
+  return IsFunctionType(ts_node_type(node)) && HasDirectToken(node, "async");
+}
+
+// Bound names of a pattern, decoded, duplicates kept.
+void CollectPatternNames(TSNode node, std::string_view source,
+                         std::vector<std::string>* names, unsigned depth = 0) {
+  if (ts_node_is_null(node) || depth > 64) return;
+  const char* type = ts_node_type(node);
+  if (std::strcmp(type, "identifier") == 0 ||
+      std::strcmp(type, "shorthand_property_identifier_pattern") == 0) {
+    names->push_back(DecodeIdentifier(NodeText(node, source)));
+    return;
+  }
+  if (std::strcmp(type, "assignment_pattern") == 0 ||
+      std::strcmp(type, "object_assignment_pattern") == 0) {
+    CollectPatternNames(Field(node, "left"), source, names, depth + 1);
+    return;
+  }
+  if (std::strcmp(type, "pair_pattern") == 0) {
+    CollectPatternNames(Field(node, "value"), source, names, depth + 1);
+    return;
+  }
+  if (std::strcmp(type, "computed_property_name") == 0) return;
+  const uint32_t count = ts_node_named_child_count(node);
+  for (uint32_t i = 0; i < count; ++i) {
+    CollectPatternNames(ts_node_named_child(node, i), source, names, depth + 1);
+  }
+}
+
+void ParameterNames(TSNode function, std::string_view source,
+                    std::vector<std::string>* names) {
+  CollectPatternNames(Field(function, "parameters"), source, names);
+  CollectPatternNames(Field(function, "parameter"), source, names);
+}
+
+bool HasDuplicate(std::vector<std::string> names) {
+  std::sort(names.begin(), names.end());
+  return std::adjacent_find(names.begin(), names.end()) != names.end();
+}
+
+// Only plain identifiers, no defaults, patterns, or rest.
+bool HasSimpleParameters(TSNode function) {
+  TSNode params = Field(function, "parameters");
+  if (ts_node_is_null(params)) return Is(Field(function, "parameter"), "identifier");
+  const uint32_t count = ts_node_named_child_count(params);
+  for (uint32_t i = 0; i < count; ++i) {
+    TSNode param = ts_node_named_child(params, i);
+    if (!Is(param, "identifier") && !IsExtra(param)) return false;
+  }
+  return true;
+}
+
+// Code that is only legal in sloppy mode. `in_generator` and `in_async` say
+// whether the node is inside a generator or async function of the subtree.
+bool IsSloppyOnlyNode(TSNode node, std::string_view source, bool in_generator,
+                      bool in_async) {
   static constexpr std::string_view kStrictReserved[] = {
       "let", "static", "yield", "implements", "interface", "package",
-      "private", "protected", "public"};
+      "private", "protected", "public", "await", "using"};
   bool found = false;
-  Walk(root, budget, [&](TSNode node, TSNode) {
+  {
     const char* type = ts_node_type(node);
+    if (IsIdentifierNode(node)) {
+      const std::string name = DecodeIdentifier(NodeText(node, source));
+      for (std::string_view word : kStrictReserved) {
+        if (name == word) found = true;
+      }
+      if (IsEvalOrArguments(name) && IsBindingOrTarget(node)) found = true;
+      return found;
+    }
+    // Tree-sitter reads `yield` and `await` identifiers as operators.
+    if (std::strcmp(type, "yield_expression") == 0 && !in_generator) {
+      found = true;
+    } else if (std::strcmp(type, "await_expression") == 0 && !in_async) {
+      found = true;
+    } else if ((std::strcmp(type, "assignment_expression") == 0 ||
+                std::strcmp(type, "augmented_assignment_expression") == 0 ||
+                std::strcmp(type, "for_in_statement") == 0) &&
+               IsCallTarget(Field(node, "left"))) {
+      found = true;
+    } else if (std::strcmp(type, "update_expression") == 0 &&
+               IsCallTarget(Field(node, "argument"))) {
+      found = true;
+    } else if (IsFunctionType(type) && !HasSimpleParameters(node)) {
+      // Non-simple lists never allow duplicates; the checker rejects those.
+    } else if (IsFunctionType(type)) {
+      std::vector<std::string> params;
+      ParameterNames(node, source, &params);
+      if (params.size() > 1 && HasDuplicate(params)) found = true;
+    }
+    if (found) return found;
     if (std::strcmp(type, "with_statement") == 0 || HasLegacySyntax(node, source)) {
       found = true;
     } else if (std::strcmp(type, "for_in_statement") == 0 &&
@@ -527,11 +699,6 @@ bool HasSloppyOnly(TSNode root, std::string_view source, Budget* budget) {
                 Is(Field(node, "body"), "function_declaration") ||
                 Is(ts_node_named_child(node, 0), "function_declaration"))) {
       found = true;  // Annex B function declaration as a statement body
-    } else if (std::strcmp(type, "identifier") == 0) {
-      const std::string_view text = NodeText(node, source);
-      for (std::string_view word : kStrictReserved) {
-        if (text == word) found = true;
-      }
     } else if (std::strcmp(type, "unary_expression") == 0 &&
                HasDirectToken(node, "delete")) {
       TSNode argument = Field(node, "argument");
@@ -540,9 +707,39 @@ bool HasSloppyOnly(TSNode root, std::string_view source, Budget* budget) {
       }
       if (Is(argument, "identifier")) found = true;
     }
-    return !found;
-  });
+  }
   return found;
+}
+
+bool HasSloppyOnly(TSNode root, std::string_view source, Budget* budget) {
+  struct Item {
+    TSNode node;
+    bool in_generator;
+    bool in_async;
+  };
+  std::vector<Item> stack = {{root, false, false}};
+  while (!stack.empty()) {
+    if (budget->node_visits >= kMaxNodeVisits) {
+      budget->exhausted = true;
+      return true;
+    }
+    ++budget->node_visits;
+    Item item = stack.back();
+    stack.pop_back();
+    if (IsSloppyOnlyNode(item.node, source, item.in_generator, item.in_async)) return true;
+    bool in_generator = item.in_generator;
+    bool in_async = item.in_async;
+    if (IsFunctionType(ts_node_type(item.node))) {
+      const bool arrow = Is(item.node, "arrow_function");
+      in_generator = arrow ? in_generator : IsGeneratorFunction(item.node);
+      in_async = (arrow && in_async) || HasDirectToken(item.node, "async");
+    }
+    const uint32_t count = ts_node_child_count(item.node);
+    for (uint32_t i = count; i-- > 0;) {
+      stack.push_back({ts_node_child(item.node, i), in_generator, in_async});
+    }
+  }
+  return false;
 }
 
 template <typename Pred>
@@ -584,6 +781,13 @@ Dependencies FindDependencies(TSNode root, std::string_view source,
     if (std::strcmp(type, "identifier") == 0 &&
         NodeText(node, source) == "arguments") {
       d.arguments = true;
+    }
+    // `await` and `yield` used as identifiers cannot move into async or
+    // generator code.
+    if (IsIdentifierNode(node)) {
+      const std::string name = DecodeIdentifier(NodeText(node, source));
+      if (name == "await") d.await_ = true;
+      if (name == "yield") d.yield_ = true;
     }
     if (std::strcmp(type, "break_statement") == 0 ||
         std::strcmp(type, "continue_statement") == 0) {
@@ -726,6 +930,7 @@ class EarlyErrors {
   bool Check(TSNode root) {
     State state;
     Visit(root, state, 0);
+    if (budget_->exhausted) error_ = true;  // unknown counts as invalid
     return error_;
   }
 
@@ -737,19 +942,72 @@ class EarlyErrors {
     std::vector<std::string> labels;
     std::vector<std::string> loop_labels;
     std::vector<std::vector<std::string>> privates;
+    bool strict = false;
+    bool generator = false;       // directly in a generator body
+    bool await_reserved = false;  // async code, static blocks, class bodies
+    bool yield_reserved = false;  // generator code
+  };
+
+  // Lexically declared names of one scope, for var-hoisting conflicts.
+  struct LexicalFrame {
+    std::set<std::string> names;
+    bool boundary = false;      // a function or static block: vars stop here
+    bool simple_catch = false;  // catch (e): `var e` in the body is allowed
   };
 
   std::string Text(TSNode node) { return std::string(NodeText(node, source_)); }
+
+  // A labelled function declaration declares like a plain one.
+  static TSNode Unlabel(TSNode statement) {
+    for (unsigned i = 0; i < 64 && Is(statement, "labeled_statement"); ++i) {
+      statement = Field(statement, "body");
+    }
+    return statement;
+  }
+
+  // In a statement list, `let` + line break + `x = 1` is one declaration to
+  // V8, two statements to Tree-sitter. Returns false when V8 would read some
+  // other declaration (or a syntax error); `*name` is empty when statement i
+  // is not such a `let`.
+  bool LetLineDeclaration(const std::vector<TSNode>& statements, size_t i,
+                          std::string* name) {
+    name->clear();
+    if (!Is(statements[i], "expression_statement") ||
+        NodeText(statements[i], source_) != "let" || i + 1 >= statements.size()) {
+      return true;
+    }
+    TSNode next = statements[i + 1];
+    TSNode expression = ts_node_named_child(next, 0);
+    if (Is(next, "expression_statement") && Is(expression, "assignment_expression") &&
+        Is(Field(expression, "left"), "identifier")) {
+      *name = DecodeIdentifier(NodeText(Field(expression, "left"), source_));
+      return !IsSpecialName(*name);
+    }
+    const std::string_view text = NodeText(next, source_);
+    const char c = text.empty() ? '\0' : text[0];
+    return !(std::isalpha(static_cast<unsigned char>(c)) || c == '_' || c == '$' ||
+             c == '\\' || c == '[' || c == '{');
+  }
 
   void CheckList(const std::vector<TSNode>& statements, bool function_level,
                  bool strict, const std::vector<std::string>& outer_lexical) {
     std::set<std::string> lexical(outer_lexical.begin(), outer_lexical.end());
     std::set<std::string> vars;
-    for (TSNode statement : statements) {
+    for (size_t index = 0; index < statements.size(); ++index) {
+      const TSNode labelled = statements[index];
+      std::string let_name;
+      if (!LetLineDeclaration(statements, index, &let_name)) error_ = true;
+      if (!let_name.empty() && (!lexical.insert(let_name).second || vars.count(let_name) != 0)) {
+        error_ = true;
+      }
       std::vector<std::string> names;
+      const TSNode statement = Unlabel(labelled);
+      if (ts_node_is_null(statement)) continue;
       const char* type = ts_node_type(statement);
       const bool function = std::strcmp(type, "function_declaration") == 0 ||
                             std::strcmp(type, "generator_function_declaration") == 0;
+      const bool plain = std::strcmp(type, "function_declaration") == 0 &&
+                         !HasDirectToken(statement, "async");
       if (std::strcmp(type, "lexical_declaration") == 0 ||
           std::strcmp(type, "class_declaration") == 0 ||
           (function && (!function_level))) {
@@ -757,14 +1015,12 @@ class EarlyErrors {
         for (const std::string& name : names) {
           // Sloppy Annex B permits duplicate plain function declarations in
           // blocks; everything else is a redeclaration error.
-          if (function && !strict && std::strcmp(type, "function_declaration") == 0 &&
-              plain_functions_.count(name) != 0 && lexical.count(name) != 0) {
+          if (plain && !strict && plain_functions_.count(name) != 0 &&
+              lexical.count(name) != 0) {
             continue;
           }
           if (!lexical.insert(name).second || vars.count(name) != 0) error_ = true;
-          if (function && std::strcmp(type, "function_declaration") == 0) {
-            plain_functions_.insert(name);
-          }
+          if (plain) plain_functions_.insert(name);
         }
       } else if (std::strcmp(type, "variable_declaration") == 0 || function) {
         CollectRaw(statement, &names);
@@ -792,7 +1048,7 @@ class EarlyErrors {
       }
     } else {
       TSNode name = Field(statement, "name");
-      if (!ts_node_is_null(name)) names->push_back(Text(name));
+      if (!ts_node_is_null(name)) names->push_back(DecodeIdentifier(Text(name)));
     }
   }
 
@@ -801,7 +1057,7 @@ class EarlyErrors {
     const char* type = ts_node_type(node);
     if (std::strcmp(type, "identifier") == 0 ||
         std::strcmp(type, "shorthand_property_identifier_pattern") == 0) {
-      names->push_back(Text(node));
+      names->push_back(DecodeIdentifier(Text(node)));
       return;
     }
     if (std::strcmp(type, "assignment_pattern") == 0 ||
@@ -817,6 +1073,183 @@ class EarlyErrors {
     const uint32_t count = ts_node_named_child_count(node);
     for (uint32_t i = 0; i < count; ++i) {
       CollectPattern(ts_node_named_child(node, i), names, depth + 1);
+    }
+  }
+
+  // The names a scope node declares lexically, or false when the node is not
+  // a scope with lexical declarations.
+  bool LexicalFrameFor(TSNode node, LexicalFrame* frame) {
+    const char* type = ts_node_type(node);
+    std::vector<std::string> names;
+    auto add_statement = [&](TSNode labelled, bool functions) {
+      TSNode statement = Unlabel(labelled);
+      if (Is(statement, "lexical_declaration") || Is(statement, "class_declaration") ||
+          (functions && (Is(statement, "function_declaration") ||
+                         Is(statement, "generator_function_declaration")))) {
+        CollectRaw(statement, &names);
+      }
+    };
+    if (std::strcmp(type, "program") == 0 || std::strcmp(type, "statement_block") == 0) {
+      TSNode parent = ts_node_parent(node);
+      const bool function_level = std::strcmp(type, "program") == 0 ||
+                                  (!ts_node_is_null(parent) &&
+                                   IsFunctionType(ts_node_type(parent)));
+      const auto statements = ListStatements(node);
+      for (size_t i = 0; i < statements.size(); ++i) {
+        add_statement(statements[i], !function_level);
+        std::string let_name;
+        LetLineDeclaration(statements, i, &let_name);
+        if (!let_name.empty()) names.push_back(let_name);
+      }
+    } else if (std::strcmp(type, "switch_body") == 0) {
+      const uint32_t cases = ts_node_named_child_count(node);
+      for (uint32_t i = 0; i < cases; ++i) {
+        TSNode clause = ts_node_named_child(node, i);
+        const uint32_t count = ts_node_named_child_count(clause);
+        for (uint32_t j = 0; j < count; ++j) add_statement(ts_node_named_child(clause, j), true);
+      }
+    } else if (std::strcmp(type, "for_statement") == 0) {
+      TSNode init = Field(node, "initializer");
+      if (!Is(init, "lexical_declaration")) return false;
+      CollectRaw(init, &names);
+    } else if (std::strcmp(type, "for_in_statement") == 0) {
+      TSNode kind = Field(node, "kind");
+      if (ts_node_is_null(kind) || NodeText(kind, source_) == "var") return false;
+      CollectPattern(Field(node, "left"), &names, 0);
+    } else if (std::strcmp(type, "catch_clause") == 0) {
+      TSNode param = Field(node, "parameter");
+      CollectPattern(param, &names, 0);
+      frame->simple_catch = Is(param, "identifier");
+    } else {
+      return false;
+    }
+    frame->names.insert(names.begin(), names.end());
+    return true;
+  }
+
+  // A var-declared name conflicts with every lexical declaration of the same
+  // name in the scopes it hoists through.
+  void CheckVarNames(const std::vector<std::string>& names) {
+    for (const std::string& name : names) {
+      for (size_t i = frames_.size(); i-- > 0;) {
+        const LexicalFrame& frame = frames_[i];
+        if (frame.boundary) break;
+        if (frame.names.count(name) != 0 && !frame.simple_catch) error_ = true;
+      }
+    }
+  }
+
+  // An optional chain along the object path of a member or call.
+  static bool HasOptionalChain(TSNode node) {
+    for (unsigned i = 0; i < 4096 && !ts_node_is_null(node); ++i) {
+      if (HasDirectToken(node, "optional_chain") || HasDirectToken(node, "?.")) return true;
+      if (Is(node, "member_expression") || Is(node, "subscript_expression")) {
+        node = Field(node, "object");
+      } else if (Is(node, "call_expression")) {
+        node = Field(node, "function");
+      } else {
+        break;
+      }
+    }
+    return false;
+  }
+
+  // Valid targets of `=`, compound assignment, update, and for-in/of heads.
+  enum class TargetOp { kAssign, kCompound, kLogical, kUpdate };
+  void CheckTarget(TSNode target, const State& state, TargetOp op) {
+    const bool logical = op == TargetOp::kLogical;
+    TSNode inner = SkipParens(target);
+    const bool parenthesized = !ts_node_eq(inner, target);
+    const char* type = ts_node_type(inner);
+    if (std::strcmp(type, "identifier") == 0) {
+      if (state.strict && IsEvalOrArguments(DecodeIdentifier(Text(inner)))) error_ = true;
+      return;
+    }
+    if (std::strcmp(type, "member_expression") == 0 ||
+        std::strcmp(type, "subscript_expression") == 0) {
+      // An optional chain is never a target.
+      if (HasOptionalChain(inner)) error_ = true;
+      return;
+    }
+    if (std::strcmp(type, "call_expression") == 0) {
+      TSNode callee = Field(inner, "function");
+      const bool tagged = Is(Field(inner, "arguments"), "template_string");
+      if (state.strict || logical || tagged || Is(callee, "import") ||
+          Is(callee, "super") || HasOptionalChain(inner)) {
+        error_ = true;
+      }
+      return;
+    }
+    // Patterns are targets only without parentheses.
+    if (!parenthesized && (std::strcmp(type, "object_pattern") == 0 ||
+                           std::strcmp(type, "array_pattern") == 0 ||
+                           std::strcmp(type, "object") == 0 ||
+                           std::strcmp(type, "array") == 0)) {
+      if (op != TargetOp::kAssign) error_ = true;
+      return;
+    }
+    error_ = true;
+  }
+
+  void CheckIdentifier(TSNode node, const State& state) {
+    const std::string_view raw = NodeText(node, source_);
+    const std::string name = DecodeIdentifier(raw);
+    // Tree-sitter reads `for (let [a] of b)` as a `let[a]` target.
+    if (name == "let") {
+      TSNode parent = ts_node_parent(node);
+      if (Is(parent, "subscript_expression") &&
+          Is(ts_node_parent(parent), "for_in_statement")) {
+        return;
+      }
+    }
+    if (raw.find('\\') != std::string_view::npos && IsAlwaysReservedWord(name)) {
+      error_ = true;
+    } else if (state.strict && IsStrictReservedWord(name)) {
+      error_ = true;
+    } else if (state.await_reserved && name == "await") {
+      error_ = true;
+    } else if (state.yield_reserved && name == "yield") {
+      error_ = true;
+    } else if (state.strict && IsEvalOrArguments(name) && IsBindingOrTarget(node)) {
+      error_ = true;
+    }
+  }
+
+  void CheckFunction(TSNode node, const State& inner) {
+    std::vector<std::string> params;
+    ParameterNames(node, source_, &params);
+    const bool simple = HasSimpleParameters(node);
+    TSNode body = Field(node, "body");
+    const bool own_strict = Is(body, "statement_block") && ListIsStrict(body, source_);
+    // "use strict" requires a simple parameter list.
+    if (own_strict && !simple) error_ = true;
+    if (!HasDuplicate(params)) return;
+    const char* type = ts_node_type(node);
+    const bool plain = std::strcmp(type, "function_declaration") == 0 ||
+                       std::strcmp(type, "function_expression") == 0 ||
+                       std::strcmp(type, "generator_function_declaration") == 0 ||
+                       std::strcmp(type, "generator_function") == 0;
+    if (!plain || !simple || inner.strict) error_ = true;
+  }
+
+  // Function declarations as the body of if, labels, or loops (Annex B).
+  void CheckStatementPosition(TSNode node, const State& state) {
+    const char* type = ts_node_type(node);
+    const bool annex_b = std::strcmp(type, "if_statement") == 0 ||
+                         std::strcmp(type, "else_clause") == 0 ||
+                         std::strcmp(type, "labeled_statement") == 0;
+    const bool loop = IsLoopType(type) || std::strcmp(type, "with_statement") == 0;
+    if (!annex_b && !loop) return;
+    TSNode bodies[] = {Field(node, "consequence"), Field(node, "body"),
+                       std::strcmp(type, "else_clause") == 0 ? ts_node_named_child(node, 0)
+                                                             : TSNode{}};
+    for (TSNode body : bodies) {
+      if (Is(body, "generator_function_declaration") || Is(body, "class_declaration") ||
+          Is(body, "lexical_declaration")) {
+        error_ = true;
+      } else if (Is(body, "function_declaration")) {
+        if (loop || state.strict || HasDirectToken(body, "async")) error_ = true;
+      }
     }
   }
 
@@ -981,8 +1414,23 @@ class EarlyErrors {
       inner.privates.push_back(declared);
       changed = true;
     }
+    if (UpdateNameState(node, &inner)) changed = true;
     State& next = changed ? inner : state;
+    CheckNames(node, state, next);
+    if (error_) return;
 
+    // Scopes whose lexical names conflict with var declarations inside.
+    const size_t frames = frames_.size();
+    if (IsFunctionType(type) || std::strcmp(type, "class_static_block") == 0) {
+      frames_.emplace_back();
+      frames_.back().boundary = true;
+    }
+    LexicalFrame frame;
+    if (LexicalFrameFor(node, &frame)) frames_.push_back(std::move(frame));
+
+    // A method's computed key is outside its (possibly strict) body.
+    const TSNode method_key = std::strcmp(type, "method_definition") == 0
+                                  ? Field(node, "name") : TSNode{};
     const uint32_t count = ts_node_named_child_count(node);
     for (uint32_t i = 0; i < count && !error_; ++i) {
       TSNode child = ts_node_named_child(node, i);
@@ -992,8 +1440,98 @@ class EarlyErrors {
            std::strcmp(type, "method_definition") == 0)) {
         continue;
       }
-      Visit(child, next, depth + 1);
+      Visit(child, !ts_node_is_null(method_key) && ts_node_eq(child, method_key) ? state : next,
+            depth + 1);
     }
+    frames_.resize(frames);
+  }
+
+  // Strictness and whether await/yield are reserved inside `node`.
+  bool UpdateNameState(TSNode node, State* inner) {
+    const char* type = ts_node_type(node);
+    const bool module = source_.substr(0, 5) == "/*M*/";
+    if (std::strcmp(type, "program") == 0) {
+      inner->strict = module || ListIsStrict(node, source_);
+      inner->await_reserved = module;
+      return true;
+    }
+    if (IsFunctionType(type)) {
+      TSNode body = Field(node, "body");
+      if (Is(body, "statement_block") && ListIsStrict(body, source_)) inner->strict = true;
+      if (std::strcmp(type, "arrow_function") == 0) {
+        inner->generator = false;
+      } else {
+        inner->generator = IsGeneratorFunction(node);
+        inner->yield_reserved = inner->generator;
+        inner->await_reserved = module;
+      }
+      if (IsAsyncFunction(node)) inner->await_reserved = true;
+      return true;
+    }
+    if (std::strcmp(type, "class") == 0 || std::strcmp(type, "class_declaration") == 0) {
+      inner->strict = true;
+      return true;
+    }
+    if (std::strcmp(type, "class_body") == 0) {
+      inner->generator = false;
+      return true;
+    }
+    if (std::strcmp(type, "class_static_block") == 0) {
+      inner->generator = false;
+      inner->await_reserved = true;
+      return true;
+    }
+    return false;
+  }
+
+  // Identifier, assignment-target, parameter, and declaration rules.
+  void CheckNames(TSNode node, const State& state, const State& inner) {
+    const char* type = ts_node_type(node);
+    if (IsIdentifierNode(node) || std::strcmp(type, "statement_identifier") == 0) {
+      CheckIdentifier(node, state);
+    } else if (std::strcmp(type, "yield_expression") == 0) {
+      // Outside generators this is the identifier `yield`.
+      if (state.strict && !state.generator) error_ = true;
+    } else if (std::strcmp(type, "assignment_expression") == 0) {
+      CheckTarget(Field(node, "left"), state, TargetOp::kAssign);
+    } else if (std::strcmp(type, "augmented_assignment_expression") == 0) {
+      const std::string_view op = NodeText(Field(node, "operator"), source_);
+      CheckTarget(Field(node, "left"), state,
+                  op == "&&=" || op == "||=" || op == "?\?=" ? TargetOp::kLogical
+                                                             : TargetOp::kCompound);
+    } else if (std::strcmp(type, "update_expression") == 0) {
+      CheckTarget(Field(node, "argument"), state, TargetOp::kUpdate);
+    } else if (std::strcmp(type, "for_in_statement") == 0) {
+      TSNode kind = Field(node, "kind");
+      if (ts_node_is_null(kind)) {
+        CheckTarget(Field(node, "left"), state, TargetOp::kAssign);
+      } else if (NodeText(kind, source_) == "var") {
+        std::vector<std::string> names;
+        CollectPattern(Field(node, "left"), &names, 0);
+        CheckVarNames(names);
+      } else {
+        std::vector<std::string> names;
+        CollectPattern(Field(node, "left"), &names, 0);
+        if (std::find(names.begin(), names.end(), "let") != names.end()) error_ = true;
+      }
+    } else if (std::strcmp(type, "variable_declaration") == 0) {
+      std::vector<std::string> names;
+      CollectRaw(node, &names);
+      CheckVarNames(names);
+    } else if (std::strcmp(type, "lexical_declaration") == 0) {
+      std::vector<std::string> names;
+      CollectRaw(node, &names);
+      if (std::find(names.begin(), names.end(), "let") != names.end()) error_ = true;
+    } else if (std::strcmp(type, "catch_clause") == 0) {
+      // A destructured catch parameter is lexically bound; a plain one is not.
+      TSNode param = Field(node, "parameter");
+      std::vector<std::string> names;
+      if (!Is(param, "identifier")) CollectPattern(param, &names, 0);
+      if (std::find(names.begin(), names.end(), "let") != names.end()) error_ = true;
+    } else if (IsFunctionType(type)) {
+      CheckFunction(node, inner);
+    }
+    CheckStatementPosition(node, state);
   }
 
   std::string_view source_;
@@ -1001,12 +1539,32 @@ class EarlyErrors {
   bool error_ = false;
   std::set<std::string> plain_functions_;
   std::set<std::string> outer_lexical_params_;
+  std::vector<LexicalFrame> frames_;
 };
 
 bool HasEarlyError(TSNode root, std::string_view source, Budget* budget) {
   EarlyErrors checker(source, budget);
   return checker.Check(root);
 }
+
+}  // namespace
+
+namespace internal {
+
+bool SourceHasEarlyError(std::string_view source) {
+  Parser parser(ts_parser_new(), ts_parser_delete);
+  if (!parser || !ts_parser_set_language(parser.get(), tree_sitter_javascript())) return true;
+  Budget budget;
+  Tree tree = Parse(parser.get(), source, &budget);
+  if (!tree || budget.exhausted) return true;
+  const TSNode root = ts_tree_root_node(tree.get());
+  const auto errors = CountSyntaxErrors(root, &budget);
+  return !errors || *errors != 0 || HasEarlyError(root, source, &budget);
+}
+
+}  // namespace internal
+
+namespace {
 
 // ---------------------------------------------------------------------------
 // Positions.
@@ -1458,11 +2016,12 @@ std::optional<std::string> EditWrapStatement(Mutation& m, bool unsafe = false) {
       {"while (" + condition + ") {\n" + s + "\nbreak;\n}", true},
       {"switch (" + condition + ") {\ncase " + condition + ":\n" + s + "\n}", true},
       {"(() => " + body + ")();", !deps.yield_ && !deps.await_ && !deps.jump},
-      {"(async () => " + body + ")();", !deps.yield_ && !deps.jump},
+      {"(async () => " + body + ")();",
+       !deps.yield_ && !deps.jump && (ctx.async || !deps.await_)},
       {"(function () " + body + ")();",
        !deps.yield_ && !deps.await_ && !deps.jump && !deps.super_},
       {"(function* () " + body + ")().next();",
-       !deps.await_ && !deps.jump && !deps.super_},
+       !deps.await_ && !deps.jump && !deps.super_ && (ctx.generator || !deps.yield_)},
       {"(class { static " + body + " });",
        !deps.yield_ && !deps.await_ && no_flow && !deps.arguments && !deps.super_call &&
            (ctx.strict || !HasSloppyOnly(*statement, m.source, m.budget))},
@@ -1595,6 +2154,79 @@ std::optional<std::string> EditCrossOver(Mutation& m) {
   return out;
 }
 
+// Rebind a visible name: shadow it in a block, redeclare it as a var,
+// reuse it for parameters, a catch parameter, or an Annex B function. The
+// early-error check that every candidate passes rejects the illegal ones.
+// Both an eagerly called and a lazily compiled function form are used.
+std::optional<std::string> EditRebind(Mutation& m) {
+  auto points = InsertionPoints(m.root, m.source, m.budget);
+  const InsertionPoint* point = PickFrom(points, m.random);
+  if (!point) return std::nullopt;
+  const GenContext ctx = ContextFor(point->list, m.source);
+  SeedInfo seed;
+  BuildSeedInfo(m.root, m.source, point->list, ctx, m.budget, &seed);
+  if (m.budget->exhausted) return std::nullopt;
+  const std::string* visible = PickFrom(seed.names, m.random);
+  const std::string n = visible ? *visible : UniqueName("n", seed, {}, m.random->Next());
+  Generator generator(m.random, 512, seed);
+  std::string e;
+  if (!generator.Expression(&e, ctx, 2)) e = "0";
+  // The body of a new plain function nested at this point.
+  GenContext fn = ctx;
+  fn.function = true;
+  fn.async = false;
+  fn.generator = false;
+  fn.loop = false;
+  fn.switch_stmt = false;
+  fn.labels.clear();
+  fn.loop_labels.clear();
+  fn.super_property = false;
+  fn.super_call = false;
+  fn.new_target = true;
+  fn.class_field = false;
+  std::string fe;
+  if (!generator.Expression(&fe, fn, 2)) fe = "0";
+  const uint32_t salt = m.random->Next();
+  const std::string p = UniqueName("p", seed, {e, fe, n}, salt);
+  const std::string c = UniqueName("c", seed, {e, fe, n}, salt + 1);
+  const std::string f = UniqueName("F", seed, {e, fe, n}, salt + 2);
+  const std::string label = UniqueName("L", seed, {e, fe, n}, salt + 3);
+  const std::string body = "{\nvar " + n + " = " + fe + ";\n{ function " + p +
+                           "() {} }\ntry {} catch (" + c + ") { var " + c + "; }\nreturn " +
+                           n + ";\n}";
+  std::vector<std::string> forms = {
+      "{\nlet " + n + " = " + e + ";\n" + n + ";\n}",
+      "{\nconst " + n + " = " + e + ";\n(() => " + n + ")();\n}",
+      "{\nclass " + n + " {}\n}",
+      "{\nfunction " + n + "() { return " + n + "; }\n}",
+      "var " + n + " = " + e + ";",
+      "for (var " + n + " in " + e + ");",
+      "try {} catch (" + n + ") {\nvar " + n + " = " + e + ";\n}",
+      "try {} catch (" + n + ") {\n{ let " + n + "; }\n}",
+      // Eager: called at once, so the full parser handles the scopes.
+      "(function (" + n + ", " + p + " = () => " + n + ") " + body + ")(" + e + ");",
+      // Lazy: only preparsed until called.
+      "function " + f + "(" + n + ", " + p + " = () => " + n + ") " + body,
+      "(" + n + " => {\nvar " + c + " = " + n + ";\n{ let " + n + " = " + c + "; }\n})(" + e + ");",
+  };
+  if (!ctx.strict) {
+    forms.insert(forms.end(), {
+        "{\nfunction " + n + "() {}\n}",
+        "if (" + e + ") function " + n + "() {}",
+        label + ": function " + n + "() {}",
+        "switch (" + e + ") {\ncase 0:\nfunction " + n + "() {}\n}",
+        "(function (" + n + ", " + p + ", " + n + ") {\nvar " + p + ";\nreturn " + n + ";\n})(" +
+            e + ");",
+        "function " + f + "(" + n + ", " + n + ") { return " + n + "; }",
+        "(function (eval, arguments) {\nreturn eval(" + n + ");\n})(" + e + ");",
+    });
+  }
+  const std::string* form = PickFrom(forms, m.random);
+  std::string out = InsertStatement(m.source, *point, *form);
+  if (out.size() > m.limit) return std::nullopt;
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 // Malformed mode.
 
@@ -1720,7 +2352,21 @@ std::optional<std::string> EditEarlyError(Mutation& m) {
       "(class { #a; #a; });", "(class { constructor; });", "class C extends D { static prototype() {} }",
       "({ get x(a) {} });", "({ set x() {} });", "async () => await;",
       "function f() { 'use strict'; delete x; }",
-      "(function () { \"use strict\"; implements = 1; });"});
+      "(function () { \"use strict\"; implements = 1; });",
+      // Names: hoisting conflicts, parameters, escaped keywords.
+      "let x; { var x; }", "{ function f() {} var f; }",
+      "try {} catch ([e]) { var e; }", "function f(a, a) { \"use strict\"; }",
+      "function f(a, [a]) {}", "({ m(a, a) {} });", "(class { m(a, a) {} });",
+      "(function () { \"use strict\"; L: function f() {} });",
+      "if (1) function* g() {}", "function* g() { yi\\u0065ld 1; }",
+      "async function f() { aw\\u0061it 1; }", "l\\u0065t x = 1;",
+      "class C { st\\u0061tic m() {} }", "function f() { n\\u0065w.target; }",
+      "class C { *constructor() {} }", "class C { #constructor; }",
+      "class C { static prototype = 1; }", "(function () { \"use strict\"; var let; });",
+      "async function f() { var await; }", "(function eval() { \"use strict\"; });",
+      // Assignment targets.
+      "[f()] = x;", "({a}) = 1;", "(f``) = 1;", "(f()) ?\?= 1;", "(new f()) = 1;",
+      "(function () { \"use strict\"; f() = 1; });", "(a?.b) = 1;"});
   const std::string* option = PickFrom(options, m.random);
   std::string out = InsertStatement(m.source, *point, *option);
   if (out.size() > m.limit) return std::nullopt;
@@ -1776,6 +2422,8 @@ std::optional<std::string> Apply(Mutation& m, EditKind kind) {
       return EditDisrupt(m);
     case EditKind::kInjectEarlyError:
       return EditEarlyError(m);
+    case EditKind::kRebind:
+      return EditRebind(m);
     default:
       return std::nullopt;
   }
@@ -1872,7 +2520,8 @@ Result MutateImpl(const uint8_t* data, size_t size, const uint8_t* donor,
              {EditKind::kWrapStatement, 12},     {EditKind::kWrapExpression, 10},
              {EditKind::kLiteral, 8},            {EditKind::kBinaryOperator, 8},
              {EditKind::kReuseSubtree, 6},       {EditKind::kDuplicateStatement, 5},
-             {EditKind::kSwapStatements, 5},     {EditKind::kDeleteStatement, 4}};
+             {EditKind::kSwapStatements, 5},     {EditKind::kDeleteStatement, 4},
+             {EditKind::kRebind, 7}};
     if (*parent_errors != 0) rules.push_back({EditKind::kRepairSyntax, 60});
     if (donor_tree) rules.push_back({EditKind::kCrossOver, 70});
   } else {

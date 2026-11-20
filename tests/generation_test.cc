@@ -83,6 +83,22 @@ bool HasNestedShape(test::Syntax& syntax, const std::string& source) {
   return found;
 }
 
+// Name and target shapes (each group: any one spelling suffices).
+const std::vector<std::vector<std::string>> kNameShapes = {
+    {"var await", "var yield", "var let", "var static", "var eval", "var arguments",
+     "let await", "let static", "const yield", "let implements", "var package"},
+    {"await: "},
+    {"(let)["},
+    {"using\n", "using["},
+    {") let\n"},
+    {"\\u{0"},
+    {"\nstatic static", "\nget;", "\nstatic;", "\nasync;", "\naccessor;", "\nset;",
+     "\nget = ", "\nstatic("},
+    {")) = ", ")) += ", ")) -= "},
+    {": function f"},
+    {") function f"},
+};
+
 void RequireConstructs(const std::map<std::string, unsigned>& counts,
                        const char* where) {
   for (const char* type : kConstructs) {
@@ -101,15 +117,24 @@ int main() {
   std::map<std::string, unsigned> empty_counts;
   unsigned empty_nested = 0;
   std::set<std::string> distinct;
+  std::vector<bool> shapes(kNameShapes.size(), false);
   for (uint32_t seed = 1; seed <= 20000; ++seed) {
     const auto result = test::Generate(2048, seed);
     Require(result.outcome == Outcome::kGeneratedValidLeaning, "empty input did not generate");
     Require(syntax.Parses(result.source), "generated program did not parse:\n" + result.source);
+    for (size_t g = 0; g < kNameShapes.size(); ++g) {
+      for (const std::string& spelling : kNameShapes[g]) {
+        if (result.source.find(spelling) != std::string::npos) shapes[g] = true;
+      }
+    }
     for (const auto& type : syntax.Types(result.source)) ++empty_counts[type];
     if (HasNestedShape(syntax, result.source)) ++empty_nested;
     distinct.insert(result.source);
   }
   RequireConstructs(empty_counts, "generation from empty input");
+  for (size_t g = 0; g < kNameShapes.size(); ++g) {
+    Require(shapes[g], "generation never produced the name shape " + kNameShapes[g][0]);
+  }
   Require(distinct.size() >= 18000, "generated programs are not diverse");
   Require(empty_nested > 0, "generation never produced the nested arrow/class/static shape");
 
