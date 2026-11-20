@@ -105,6 +105,50 @@ int main() {
     }
   }
   Require(transplanted, "crossover never combined both inputs");
+
+  // Scope stress: laziness, capture and direct eval edits stay valid.
+  auto occurrences = [](const std::string& text, const std::string& what) {
+    unsigned n = 0;
+    for (size_t at = text.find(what); at != std::string::npos; at = text.find(what, at + 1)) ++n;
+    return n;
+  };
+  const std::vector<std::string> scope_parents = {
+      parents[1], "(function (a) { let c = a; return () => c; })(1);\nlet y = 2;\ny + 1;"};
+  unsigned laziness = 0, pife = 0, nested = 0, captures = 0, evals = 0, lazy_errors = 0;
+  for (uint32_t seed = 1; seed <= 600; ++seed) {
+    for (const auto& parent : scope_parents) {
+      const auto result = test::Mutate(parent, 4096, seed);
+      if (result.edit == EditKind::kLaziness || result.edit == EditKind::kCapture) {
+        Require(syntax.Parses(result.source), "scope edit did not parse:\n" + result.source);
+        Require(result.outcome == Outcome::kEditedValidLeaning, "scope edit was not clean");
+      }
+      if (result.edit == EditKind::kLaziness) {
+        ++laziness;
+        if (result.source.find("var g") != std::string::npos) ++pife;
+        if (occurrences(result.source, "{\n") >= occurrences(parent, "{\n") + 2) ++nested;
+      }
+      if (result.edit == EditKind::kCapture) ++captures;
+      if (result.edit == EditKind::kGenerateStatement &&
+          result.source.find("eval(") != std::string::npos) {
+        ++evals;
+      }
+      const auto broken_result = test::Mutate(parent, 4096, seed, 0);
+      if (broken_result.edit == EditKind::kInjectEarlyError &&
+          (broken_result.source.find("\nvar z") != std::string::npos ||
+           broken_result.source.find("let price;") != std::string::npos)) {
+        ++lazy_errors;
+      }
+    }
+  }
+  Require(laziness >= 20 && pife >= 3 && nested >= 5, "laziness edits are rare");
+  Require(captures >= 30, "capture edits are rare");
+  Require(evals >= 10, "direct eval statements are rare");
+  Require(lazy_errors >= 10, "early errors in lazy bodies are rare");
+  unsigned generated_eval = 0;
+  for (uint32_t seed = 1; seed <= 300; ++seed) {
+    if (test::Generate(2048, seed).source.find("eval(") != std::string::npos) ++generated_eval;
+  }
+  Require(generated_eval >= 20, "generation rarely calls eval");
   std::cout << "mutator contract: ok\n";
   return 0;
 }

@@ -568,6 +568,10 @@ std::string Generator::Parameters(const GenContext& ctx, unsigned depth,
           value = ArrowFunction(ctx, d);
         } else if (pick < 28) {
           value = FunctionExpressionOrDeclaration(ctx, d, false, &ignored);
+        } else if (pick < 34) {
+          // Direct eval in a parameter scope, alone or captured by an arrow.
+          value = EvalCall(ctx, d).text;
+          if (random_->Chance(50)) value = "() => " + value;
         } else {
           value = Fit(ExpressionImpl(ctx, d), kAssign);
         }
@@ -1417,7 +1421,37 @@ Expr Generator::Assignment(const GenContext& ctx, unsigned depth) {
           kAssign, 0};
 }
 
+std::string Generator::EvalArgument(const GenContext& ctx, unsigned depth) {
+  static constexpr std::string_view kSnippets[] = {
+      "\"\"", "\"0\"", "\"this\"", "\"var ev = 1\"", "'let ev = 2; ev'",
+      "\"(function () { return 1; })\"", "\"typeof ev\"",
+      "'{ function ev() {} }'", "\"arguments\"", "\"() => this\""};
+  const unsigned pick = random_->Below(100);
+  std::string name;
+  if (pick < 30 && VisibleName(&name, false) && name.find('\\') == std::string::npos) {
+    return "\"" + name + "\"";
+  }
+  if (pick < 40) return Fit(ExpressionImpl(ctx, depth), kAssign);
+  return std::string(random_->Pick(kSnippets));
+}
+
+Expr Generator::EvalCall(const GenContext& ctx, unsigned depth) {
+  const std::string arg = EvalArgument(ctx, depth);
+  const unsigned pick = random_->Below(100);
+  if (pick < 72) return {"eval(" + arg + ")", kLHS, kCall};
+  if (pick < 82) return {"(eval)(" + arg + ")", kLHS, kCall};
+  // Indirect forms, for contrast.
+  if (pick < 89) return {"eval?.(" + arg + ")", kLHS, kCall | kOptional};
+  if (pick < 95) return {"(0, eval)(" + arg + ")", kLHS, kCall};
+  return {"globalThis.eval(" + arg + ")", kLHS, kCall};
+}
+
 Expr Generator::Call(const GenContext& ctx, unsigned depth) {
+  // Direct eval, more often in class elements and methods, where scope
+  // analysis has the most cases.
+  if (random_->Chance(ctx.class_field || ctx.super_property ? 14 : 6)) {
+    return EvalCall(ctx, depth);
+  }
   const unsigned pick = random_->Below(100);
   if (pick < 8 && ctx.super_call) {
     return {"super(" + ArgumentList(ctx, depth) + ")", kLHS, kCall};
@@ -1541,7 +1575,10 @@ Expr Generator::ExpressionImpl(const GenContext& ctx, unsigned depth) {
       return {ArrowFunction(ctx, d), kAssign, 0};
     case kFunction: {
       std::string ignored;
-      return {FunctionExpressionOrDeclaration(ctx, d, false, &ignored), kPrimary, 0};
+      std::string text = FunctionExpressionOrDeclaration(ctx, d, false, &ignored);
+      // A parenthesized function is compiled eagerly, the rest lazily.
+      if (random_->Chance(25)) text = "(" + text + ")";
+      return {text, kPrimary, 0};
     }
     case kClass: {
       std::string ignored;
@@ -1574,7 +1611,8 @@ bool Generator::Program(std::string* out, unsigned depth,
     std::string text;
     if (random_->Chance(3)) text = "#!/usr/bin/env node\n";
     std::string list;
-    for (unsigned tries = 0; tries < 4 && list.empty(); ++tries) {
+    // A lone empty statement is as much a dead end as nothing.
+    for (unsigned tries = 0; tries < 4 && (list.empty() || list == ";"); ++tries) {
       list = StatementList(ctx, depth > attempt ? depth - attempt : 1,
                            std::max(1u, max_statements), true, nullptr);
     }
