@@ -2122,7 +2122,12 @@ std::string Generator::FunctionExpressionOrDeclaration(
   std::string text = std::string(is_async ? "async " : "") + "function" +
                      (is_generator ? "*" : "") + (name.empty() ? "" : " " + name);
   plain_function_ = true;
-  return text + " " + FunctionTail(ctx, depth, body, 0, 3, true, extra, false);
+  text += " " + FunctionTail(ctx, depth, body, 0, 3, true, extra, false);
+  // V8 compiles a parenthesized function expression eagerly (PIFE heuristic).
+  // About a quarter are wrapped, keyed on the text so no random draw shifts
+  // the rest of the program.
+  if (!declaration && text.size() % 4 == 0) text = "(" + text + ")";
+  return text;
 }
 
 std::string Generator::ArrowFunction(const GenContext& ctx, unsigned depth) {
