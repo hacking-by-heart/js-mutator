@@ -4,6 +4,8 @@
 #include <string>
 #include <vector>
 
+#include "../src/generator.h"
+
 using js_mutator::EditKind;
 using js_mutator::Outcome;
 using test::Require;
@@ -149,6 +151,78 @@ int main() {
     if (test::Generate(2048, seed).source.find("eval(") != std::string::npos) ++generated_eval;
   }
   Require(generated_eval >= 20, "generation rarely calls eval");
+  // The early-error checker agrees with V8 15.8 on names and targets.
+  const char* const kEarlyErrors[] = {
+      "let x; { var x; }", "{ var x; } let x;", "{ let x; { var x; } }",
+      "{ function f(){} var f; }", "{ function f(){} { var f; } }",
+      "try {} catch ([e]) { var e; }", "for (let i;;) { var i; }",
+      "for (let x of []) { var x; }", "switch (1) { case 1: let x; case 2: { var x; } }",
+      "class C { static { let y; { var y; } } }", "let\nx = 1; var x;",
+      "(a, a) => 1;", "({ m(a, a) {} });", "class C { m() { (function (a, a) {}); } }",
+      "function f(a, a) { \"use strict\"; }", "function f(a, [a]) {}",
+      "function f(a, a = 1) {}", "function f(a = 1) { \"use strict\"; }",
+      "function eval() { \"use strict\"; }", "function f(eval) { \"use strict\"; }",
+      "let f; L: function f(){}", "try {} catch (f) { function f() {} }",
+      "\"use strict\"; L: function f(){}", "\"use strict\"; if (1) function f(){}",
+      "if (1) function* g(){}", "L: async function f(){}", "while (1) function f(){}",
+      "{ async function f() {} function f() {} }", "\"use strict\"; var let = 1;",
+      "\"use strict\"; ({static});", "let let = 1;", "try {} catch ([let]) {}",
+      "async function f() { var await; }", "class C { static { var await; } }",
+      "var v\\u0061r = 1;", "\"use strict\"; (f()) = 1;", "\"use strict\"; f()++;",
+      "(f()) ?\?= 1;", "(f()) &&= 1;", "(f``) = 1;", "({a}) = 1;", "([a]) = 1;",
+      "(new f()) = 1;", "(a?.b) = 1;", "(import(\"x\")) = 1;", "\"use strict\"; (eval) = 1;",
+      "\"use strict\"; eval++;", "\"use strict\"; for ((f()) of o);"};
+  for (const char* source : kEarlyErrors) {
+    Require(js_mutator::internal::SourceHasEarlyError(source),
+            std::string("checker missed an early error: ") + source);
+  }
+  const char* const kValid[] = {
+      "try {} catch (e) { var e; }", "try {} catch (e) { for (var e in []); }",
+      "try {} catch (e) { { var e; } }", "try {} catch (e) { { function e() {} } }",
+      "function f(a, a) {}", "function* g(a, a) {}", "async function h(a, a) {}",
+      "(function (a, b, a) { var b; });", "function f(a = 1) { var a; }",
+      "let x; function g() { var x; }", "function f(x) { { let x; } var x; }",
+      "if (1) function f() {}", "L: function f() {}", "let f; { function f() {} }",
+      "let f; if (1) function f() {}", "function g(f) { { function f() {} } }",
+      "{ function f() {} function f() {} }", "switch (1) { case 1: function f() {} }",
+      "var await = 1; await + 1;", "var yield = 1; (yield) * 2;",
+      "var let = 1; (let)[0] = 2;", "await: ;", "await: { break await; }",
+      "if (1) let\nx = 1", "let\nx = 1; x;", "({await, yield, let, static});",
+      "using\nx", "using[x];", "function f(eval, arguments, let, static) {}",
+      "try {} catch (let) {}", "var \\u{0061}wait = 1;", "var a\\u{00000062}c = 1; abc;",
+      "let x\\u0031 = 1; { let x1 = 2; }", "class A { get; set; static; async; accessor; }",
+      "class A { static(){} static = 1; static static(){} get static() {} }",
+      "class A { x = 1\ny = 2\n#z = 3\nm() {} }",
+      "var x, o = {}; (x) = 1; ((o.p)) = 2; (x) += 1; (o.p) ?\?= 3; (x)++; ++(o.p);",
+      "(f()) = 1;", "(f()) += 1;", "f()++;", "++f();", "for ((f()) of o);",
+      "for ((x) in o);", "({ [(f())++]() { \"use strict\"; } });",
+      "(function () { \"use strict\"; for (let [a] of b); });"};
+  for (const char* source : kValid) {
+    Require(!js_mutator::internal::SourceHasEarlyError(source),
+            std::string("checker rejected valid code: ") + source);
+  }
+
+  // Rebinding reuses visible names in new scopes, as vars, parameters, and
+  // Annex B functions, and never produces an early error.
+  const std::string scoped =
+      "function f(a, b = () => a) { let x = a; try { g(); } catch (e) { x = e; } return x; }";
+  unsigned rebinds = 0;
+  bool shadowed = false;
+  for (uint32_t seed = 1; seed <= 400; ++seed) {
+    const auto result = test::Mutate(scoped, 4096, seed);
+    if (result.edit != EditKind::kRebind) continue;
+    ++rebinds;
+    Require(!js_mutator::internal::SourceHasEarlyError(result.source),
+            "rebind produced an early error:\n" + result.source);
+    for (const char* form : {"var a", "let x", "catch (e)", "function e", "(a, ", "var x"}) {
+      if (result.source.find(form) != std::string::npos &&
+          scoped.find(form) == std::string::npos) {
+        shadowed = true;
+      }
+    }
+  }
+  Require(rebinds >= 10, "rebind edits are rare");
+  Require(shadowed, "rebind never reused a visible name");
   std::cout << "mutator contract: ok\n";
   return 0;
 }

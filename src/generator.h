@@ -142,8 +142,34 @@ class Generator {
   void Declare(const std::string& name);
   void PushScope();
   void PopScope();
-  bool VisibleName(std::string* out, bool reference);
-  bool AssignableName(std::string* out);
+  // With `ctx`, names that are only legal in sloppy non-async non-generator
+  // code (await, yield, let, eval, ...) are returned only where legal.
+  bool VisibleName(std::string* out, bool reference,
+                   const GenContext* ctx = nullptr);
+  bool AssignableName(std::string* out, const GenContext* ctx = nullptr);
+
+  // Binding names: fresh, reused from an outer scope (shadowing), or one of
+  // the contextually reserved words where the context allows it.
+  enum class BindKind { kNone, kVar, kLexical, kParam, kCatch };
+  struct Frame {
+    bool function = false;     // a function's parameter and body scope
+    bool catch_param = false;  // the scope of a catch parameter
+    std::vector<std::string> var_blocked;  // hoisted var names, no lexical reuse
+  };
+  std::string BindingName(const GenContext& ctx, BindKind kind,
+                          std::string_view prefix);
+  bool ReuseName(const GenContext& ctx, BindKind kind, std::string* out);
+  bool SpecialNamesAllowed(const GenContext& ctx) const;
+  bool NameUsableIn(const std::string& name, const GenContext& ctx) const;
+  std::string EscapeIdent(const std::string& name);
+  bool FrameHasSpecialOrDuplicate() const;
+  std::string AnnexBStatement(const GenContext& ctx, unsigned depth);
+  std::string SpecialFormStatement(const GenContext& ctx, unsigned depth,
+                                   bool list);
+  std::string ContextualClassMember(const GenContext& body_ctx,
+                                    const GenContext& outer, unsigned depth);
+  std::string CallTarget(const GenContext& ctx, unsigned depth);
+  std::string ParenthesizedTarget(const GenContext& ctx, unsigned depth);
 
   // Lexical rules.
   std::string NumberLiteral(bool strict);
@@ -209,11 +235,30 @@ class Generator {
   unsigned name_counter_ = 0;
   unsigned nodes_left_ = 0;
   bool avoid_contextual_ = false;
+  std::vector<Frame> frames_;            // parallel to scopes_
+  BindKind bind_kind_ = BindKind::kNone;  // kind of names BindingPattern makes
+  unsigned no_special_ = 0;     // inside async/generator parameters or arrows
+  bool plain_function_ = false;  // next FunctionTail is a plain function
+  std::set<std::string> special_used_;
 };
+
+// Words that are identifiers only in sloppy, non-async, non-generator code
+// (or that may not be bound in strict code).
+bool IsSpecialName(std::string_view name);
 
 // True when an expression statement starting with `text` would be parsed as
 // something else (a block, declaration, or `let [` declaration).
 bool NeedsStatementParens(std::string_view text);
+
+// An identifier spelling with its \uXXXX and \u{...} escapes decoded.
+std::string DecodeIdentifier(std::string_view text);
+
+// Reserved only in strict code: let, static, yield, implements, and so on.
+bool IsStrictReservedWord(std::string_view name);
+
+// True when Tree-sitter reports a syntax error or the early-error checker
+// reports a parse-time error. Defined in mutator.cc; used by tests.
+bool SourceHasEarlyError(std::string_view source);
 
 }  // namespace internal
 }  // namespace js_mutator

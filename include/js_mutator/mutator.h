@@ -28,6 +28,7 @@ enum class EditKind {
   kInjectEarlyError,    // malformed mode: an early (parse-time) error
   kLaziness,            // change which functions V8 preparses or compiles eagerly
   kCapture,             // reference a binding from a closure, eval or TDZ position
+  kRebind,              // redeclare or shadow a visible name
 };
 
 struct Config {
