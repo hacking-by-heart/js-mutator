@@ -182,6 +182,20 @@ An empty corpus also works; the mutator generates programs from scratch. The cor
 
 By default about 90% of outputs are valid JavaScript and the rest are deliberately broken, to exercise the parser's error handling. Set `JS_MUTATOR_VALID_PERCENT` (0–100) to change that mix. The JavaScript vocabulary is compiled in, so `-dict` is unnecessary.
 
+### Long runs
+
+For a run of hours, use fork mode and save every crash to one directory:
+
+```sh
+mkdir -p ../crashes
+out/js-mutator/v8_js_mutator_parser_fuzzer ../corpus -max_len=2048 -fork=6 -ignore_crashes=1 -timeout=25 -artifact_prefix=../crashes/
+```
+
+- `-fork=6` runs six child processes. Keep the total over all runs well below the number of cores. With 22 children on 24 cores, one child was counted as a crash that left no crash file and no sanitizer report, so it could not be reproduced.
+- `-ignore_crashes=1` keeps fuzzing after a crash.
+- `-timeout=25` saves an input that runs longer than 25 seconds as a `timeout-*` file. The default waits 1200 seconds.
+- `-artifact_prefix=../crashes/` writes the `crash-*`, `timeout-*` and `oom-*` files there.
+
 ### Flag groups
 
 V8 flags go on the same command line as libFuzzer flags. Run one group per process, over one shared corpus, and always reproduce a crash with the flags of the group that found it:
@@ -221,3 +235,56 @@ python3 ../js-mutator/tools/cov_summary.py ../cov.txt
 ```
 
 Pass an older `cov.txt`, or an older summary, as a second argument to add a delta column.
+
+## 6. Triage a crash
+
+Run these from `v8/`, one line at a time.
+
+Replay the input with the target that found it, and with the same V8 flags:
+
+```sh
+out/js-mutator/v8_js_mutator_compile_fuzzer ../crashes/crash-<hash>
+```
+
+The `SUMMARY:` line and the first stack frames show where it crashed. Frames in `src/parsing/` and `src/ast/` are the parser.
+
+Reduce the input by hand to a small `repro.js` and check it with d8 from the same build. An input from the compile target may need a call to its function, because d8 compiles a function only when it runs:
+
+```sh
+ninja -C out/js-mutator d8
+out/js-mutator/d8 repro.js
+```
+
+d8 prints only `Received signal 11` for a segfault. Get the stack with gdb:
+
+```sh
+gdb -batch -ex run -ex bt --args out/js-mutator/d8 repro.js
+```
+
+### Does it affect release builds?
+
+The fuzzing build has DCHECKs on. Build a d8 without them, like the V8 in Chrome and Node:
+
+```sh
+gn gen out/release --args='is_debug=false dcheck_always_on=false is_asan=false is_component_build=false symbol_level=1 v8_enable_fuzztest=false use_sysroot=false'
+ninja -C out/release d8
+out/release/d8 repro.js
+```
+
+If only the DCHECK build crashes, it is a debug-check failure. For a scope or context bug, also compare the bytecode of one function that `repro.js` calls (here `inner`) between eager and lazy compilation. Different bytecode for the same function is how CVE-2024-5274 became exploitable:
+
+```sh
+out/release/d8 --no-lazy --print-bytecode --print-bytecode-filter=inner repro.js
+out/release/d8 --print-bytecode --print-bytecode-filter=inner repro.js
+```
+
+Also compare two calls of the function with `%ForceFlush(f); gc();` between them, run with `--allow-natives-syntax --expose-gc`.
+
+### Is it already fixed?
+
+List later V8 commits to the crashing file:
+
+```sh
+git fetch origin
+git log --oneline HEAD..origin/main -- src/ast/scopes.cc
+```
