@@ -2,7 +2,7 @@
 
 A libFuzzer custom mutator for JavaScript parsers. Its JavaScript tokens and grammar rules are compiled in. It generates new programs from empty input and transforms corpus seeds, using the seed's own in-scope variables and expressions, into more varied and deeply nested JavaScript. Output is valid by default, with an optional mode that breaks it deliberately.
 
-- [Requirements](docs/REQUIREMENTS.md) · [Design](docs/DESIGN.md) · [Verification](docs/TESTING.md) · [V8 integration](docs/V8_INTEGRATION.md)
+- [Requirements](docs/REQUIREMENTS.md) · [Design](docs/DESIGN.md) · [Verification](docs/TESTING.md) · [V8 integration](docs/V8_INTEGRATION.md) · [V8 harnesses](docs/HARNESSES.md)
 
 ## Build and test
 

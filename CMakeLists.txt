@@ -42,6 +42,10 @@ option(JS_MUTATOR_BUILD_LIBFUZZER_ADAPTER "Build the libFuzzer callback adapter"
 if(JS_MUTATOR_BUILD_LIBFUZZER_ADAPTER)
   add_library(js_mutator_libfuzzer OBJECT adapters/libfuzzer.cc)
   target_link_libraries(js_mutator_libfuzzer PUBLIC js_mutator)
+  # The same callbacks writing a per-unit yield log (see tools/yield.py).
+  add_library(js_mutator_libfuzzer_yield OBJECT adapters/libfuzzer.cc)
+  target_link_libraries(js_mutator_libfuzzer_yield PUBLIC js_mutator)
+  target_compile_definitions(js_mutator_libfuzzer_yield PRIVATE JS_MUTATOR_YIELD_LOG)
 endif()
 
 include(CTest)
@@ -50,6 +54,7 @@ if(BUILD_TESTING)
     add_executable(js_mutator_${test_name}_test tests/${test_name}_test.cc)
     target_link_libraries(js_mutator_${test_name}_test PRIVATE js_mutator js_mutator_tree_sitter
                                                               js_mutator_javascript_grammar)
+    target_include_directories(js_mutator_${test_name}_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
     add_test(NAME js_mutator_${test_name}_test COMMAND js_mutator_${test_name}_test)
   endforeach()
   if(JS_MUTATOR_BUILD_LIBFUZZER_ADAPTER)
@@ -59,6 +64,22 @@ if(BUILD_TESTING)
                                                          js_mutator_javascript_grammar)
     add_test(NAME js_mutator_adapter_test COMMAND js_mutator_adapter_test)
     set_tests_properties(js_mutator_adapter_test PROPERTIES ENVIRONMENT "JS_MUTATOR_VALID_PERCENT=100")
+    add_executable(js_mutator_adapter_yield_test tests/adapter_test.cc)
+    target_compile_definitions(js_mutator_adapter_yield_test PRIVATE JS_MUTATOR_YIELD_TEST)
+    target_link_libraries(js_mutator_adapter_yield_test PRIVATE js_mutator_libfuzzer_yield
+                                                               js_mutator_tree_sitter
+                                                               js_mutator_javascript_grammar)
+  endif()
+  find_package(Python3 COMPONENTS Interpreter)
+  if(Python3_FOUND)
+    if(JS_MUTATOR_BUILD_LIBFUZZER_ADAPTER)
+      add_test(NAME js_mutator_yield_test
+               COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/yield_test.py
+                       $<TARGET_FILE:js_mutator_adapter_yield_test>)
+      set_tests_properties(js_mutator_yield_test PROPERTIES ENVIRONMENT "JS_MUTATOR_VALID_PERCENT=100")
+    endif()
+    add_test(NAME js_mutator_cov_summary_test
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/cov_summary_test.py)
   endif()
   # Optional: check acceptance with V8's own parser when Node.js is installed.
   find_program(JS_MUTATOR_NODE node)

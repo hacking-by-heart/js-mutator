@@ -26,6 +26,17 @@ enum class EditKind {
   kGenerateProgram,     // replace the parent with a generated program
   kDisruptSyntax,       // malformed mode: token-level corruption
   kInjectEarlyError,    // malformed mode: an early (parse-time) error
+  kLaziness,            // change which functions V8 preparses or compiles eagerly
+  kCapture,             // reference a binding from a closure, eval or TDZ position
+  kRebind,              // redeclare or shadow a visible name
+  kMagicComment,        // rebuild //# sourceURL, debugId, compile-hint comments
+  kRegexMalformed,      // malformed mode: a regexp syntax error or bad flags
+  kParamScope,          // move seed code into a parameter default
+  kUnwrap,              // replace an expression with one of its operands
+  kDeleteRange,         // delete 2-8 consecutive statements
+  kDeepen,              // nest an expression in many neutral wrappers
+  kPrivateRename,       // rename a class's private name and its uses
+  kFlipGoal,            // switch between Script and Module (/*M*/ tag)
 };
 
 struct Config {

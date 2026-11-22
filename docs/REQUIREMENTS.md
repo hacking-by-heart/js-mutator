@@ -10,7 +10,7 @@
 - **Valid by default:** Tree-sitter check plus an early-error checker. V8 accepted 9,996 of 10,000 valid-leaning samples; the 4 rejects are valid code that JavaScriptCore accepts, apparently a V8 parser bug. The malformed mode is rejected by V8 about 97% of the time.
 - **Coverage loop:** retained inputs are the next parents; invalid parents are repaired instead of discarded; custom crossover combines corpus entries.
 - **Bounded and reproducible:** deterministic, size- and work-limited, sanitizer-tested.
-- **Profile:** ECMAScript Script goal as accepted by V8 12.5. Modules, decorators, and `using` are excluded (see Design).
+- **Profile:** ECMAScript Script and Module goals as accepted by V8 15.8 without experimental flags, including `using` declarations. Modules are tagged with a leading `/*M*/`. Decorators and auto-accessors are excluded (see Design).
 
 ## 1. Core interface and portability
 
