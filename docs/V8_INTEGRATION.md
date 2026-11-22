@@ -193,13 +193,13 @@ V8 flags go on the same command line as libFuzzer flags. Run one group per proce
 - `--stack-size=200`: parser and compiler stack overflows (`Isolate::StackOverflow`). With this ASan build, d8 reports a stack overflow for 200 to 400 nested parentheses or arrays, which `kDeepen` reaches within 2,048 bytes, while ordinary inputs still parse. Calibrate again for a different build.
 - `--js-regexp-buffer-boundaries --regexp-possessive-quantifier`: extra regexp syntax for the regexp parser (`\A`, `\z`, `\Z`, and `a*+`).
 
-The compile target always needs `--no-compilation-cache`; without it, re-runs of an input hit the cache and skip the parse:
+The compile target turns off the compilation cache itself, so every re-run of an input parses it again:
 
 ```sh
-out/js-mutator/v8_js_mutator_compile_fuzzer ../corpus -max_len=2048 --no-compilation-cache
+out/js-mutator/v8_js_mutator_compile_fuzzer ../corpus -max_len=2048
 ```
 
-For the compile target, also run a group with `--no-compilation-cache --stress-lazy`, and one with `--no-compilation-cache --stress-lazy-source-positions`. Do not use `--stress-lazy-compilation`: it simulates stack overflows.
+For the compile target, also run a group with `--stress-lazy`, and one with `--stress-lazy-source-positions`. Do not use `--stress-lazy-compilation`: it simulates stack overflows.
 
 If a flag is misspelled, the target prints `Unrecognized flag` at startup.
 
