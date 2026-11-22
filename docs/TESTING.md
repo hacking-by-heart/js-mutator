@@ -58,6 +58,38 @@ Edges per file from `tools/cov_summary.py` on `-runs=0 -print_coverage=1` replay
 
 The parser target does not compile lazy functions, so the preparse-data consumer stays at the old level; `v8_js_mutator_compile_fuzzer` is the target for it.
 
+## Fuzzing run (V8 15.8.62.31, 2026-11-22)
+
+Two hours of the parser and compile targets in fork mode, from the 8,390-file corpus of the 15-minute run above:
+
+| Target | Inputs run | Edges | Corpus | Crashes |
+|---|---:|---:|---:|---|
+| parser | 4,827,167 | 27,622 | 8,664 | 0 reproducible |
+| compile | 2,686,109 | 37,432 | 10,513 | 14, all one V8 bug |
+
+One parser child was counted as a crash but left no crash file and no sanitizer report. The run had 22 children on 24 cores; see "Long runs" in the V8 integration guide.
+
+### V8 bug: null dereference in `RecordNeedsPrivateNameContextChainRecalc`
+
+The compile target found it in its first minute. Reduced:
+
+```js
+class C extends (function(a = 1) { let y; return () => y; })()() {}
+```
+
+With DCHECKs on, d8 crashes with a SEGV at address 0x88 when it compiles the arrow function:
+
+```text
+DeclarationScope::RecordNeedsPrivateNameContextChainRecalc  src/ast/scopes.cc
+Scope::DeserializeScopeChain                                src/ast/scopes.cc
+Parser::DeserializeScopeChain                               src/parsing/parser.cc
+Parser::ParseFunction                                       src/parsing/parser.cc
+```
+
+- Cause: V8 commit `cd24b54657a` (2026-10-10) calls the recalc while it deserializes a scope. A function with a default parameter has an extra var-block scope. In a class heritage that scope carries the private-name skip bit, so the call runs on it before its outer scope is linked, and the DCHECK walks to a null outer scope.
+- Release builds are not affected. Without the DCHECK the call only sets a flag that nothing reads on that scope. A release d8 gave the same results and identical bytecode for eager, lazy and post-`%ForceFlush` compilation of the affected functions.
+- Fixed upstream by `552df1f2286` (2026-11-18, crbug 574565617), which removes the call. V8 before that commit, including 15.8.62.31, still crashes, so the compile target keeps finding this bug until the fix is applied.
+
 ## Older V8 parser acceptance (Node)
 
 Measured earlier with V8 via Node 26.9 `vm.Script` (compile only), using `tools/sample.cc` output:
