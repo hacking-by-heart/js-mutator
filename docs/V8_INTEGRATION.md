@@ -33,14 +33,7 @@ The harness sources live in this repository under `harness/`, so nothing is copi
 
 All four accept inputs up to 2048 bytes; unlike V8's `parser.cc`, they do not drop inputs with unbalanced brackets. Non-ASCII input is decoded as UTF-8. A leading `/*M*/` comment selects the module goal; in `parser.cc` and `diff.cc`, `/*R*/` selects REPL mode and `/*E*/` eval. `parser.cc` also enables compile-hints magic comments for half of the inputs (by input hash) and re-parses each regexp literal into a regexp AST. Every target runs a full GC every 64 inputs.
 
-### What the parser and compile targets reach
-
-V8 parses a script in two steps. When the script loads, the parser reads the top level and only preparses function bodies: it checks their syntax and saves what it needs to parse them later. A function body is parsed fully the first time the function is called. V8 then rebuilds the function's outer scopes from saved data, parses the body and generates bytecode.
-
-- The parser target runs only the first step. It never parses an inner function body fully.
-- The compile target runs both steps for every function, without calling any. It reaches parser code that runs only on a first call: `Parser::ParseFunction`, `Scope::DeserializeScopeChain`, preparse-data reuse and class member initializer reparsing. It also generates bytecode, which is not parser code.
-
-Both targets fuzz the parser. To see where a crash is, read its stack: frames in `src/parsing/` and `src/ast/` are the parser.
+[V8 harnesses](HARNESSES.md) explains in plain terms what each target does and why the compile target is needed.
 
 ## 3. Add the GN targets
 
