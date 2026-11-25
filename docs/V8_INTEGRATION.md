@@ -60,6 +60,7 @@ source_set("js_mutator_for_fuzzing") {
   configs -= [
     "//build/config/compiler:chromium_code",
     "//build/config/compiler:no_exceptions",
+    "//build/config/clang:find_bad_constructs",
   ]
   configs += [
     "//build/config/compiler:no_chromium_code",
@@ -96,8 +97,32 @@ foreach(harness, [ "parser", "compile", "diff", "streaming" ]) {
 Why each part is needed:
 
 - The mutator catches `std::bad_alloc`, so its source set enables C++ exceptions.
+- The source set also drops Chromium's clang style plugin (`find_bad_constructs`). The mutator does not follow Chromium style, and older toolchains (clang 19, as in V8 12.5) otherwise fail with "Complex class/struct needs an explicit out-of-line constructor".
 - `libs = [ "stdc++" ]` is required. Clang's libFuzzer runtime uses libstdc++ while V8 builds with libc++, so without it linking fails with undefined `std::__cxx11` symbols.
 - The adapter defines `LLVMFuzzerCustomMutator` and `LLVMFuzzerCustomCrossOver`. Each target is its own executable, so each links it once.
+
+### Older V8 versions
+
+The harnesses use V8's internal parser API as of 15.8 and do not compile against older versions such as 12.5. There, run the mutator with V8's own parser fuzzer, `test/fuzzer/parser.cc`, by adding this target next to the ones above:
+
+```gn
+v8_executable("v8_js_mutator_v8parser_fuzzer") {
+  testonly = true
+  sources = [ "test/fuzzer/parser.cc" ]
+  deps = [
+    ":fuzzer_support",
+    ":js_mutator_for_fuzzing",
+  ]
+  configs = [
+    ":external_config",
+    ":internal_config_base",
+    ":js_mutator_fuzzer_link",
+  ]
+  libs = [ "stdc++" ]
+}
+```
+
+Build only this target (`ninja -C out/js-mutator v8_js_mutator_v8parser_fuzzer`). V8's `parser.cc` drops inputs over 2048 bytes, inputs with non-printable characters and inputs with unbalanced brackets, counting brackets inside strings, templates and regexps, so some mutator outputs are never parsed.
 
 ## 4. Build
 
@@ -113,7 +138,7 @@ These are the verified arguments. `dcheck_always_on=true` keeps V8's internal co
 
 ### If linking fails with `libclang_rt.fuzzer.a: No such file or directory`
 
-V8 ships its own Clang but not the libFuzzer runtime. Build that one library from the LLVM commit your Clang was made from, then copy it where the linker looks. Run these from `workspace/`, one line at a time.
+V8 ships its own Clang but not the libFuzzer runtime. Install it from your distribution or build it from source, then put it where the linker looks. Run these from `workspace/`, one line at a time.
 
 Find your Clang's version and commit:
 
@@ -128,6 +153,19 @@ clang version 24.0.0git (https://chromium.googlesource.com/a/external/github.com
 ```
 
 Note two values: the major version (`24`) and the commit hash at the end (`e063be79…`). Substitute your own values where the commands below show `24` and `e063be79adf127cce301fe5948273102a33012b6`.
+
+#### From a Debian or Ubuntu package
+
+If your distribution packages LLVM with the same major version, install its runtime and link it into V8's Clang:
+
+```sh
+sudo apt install libclang-rt-24-dev
+ln -s /usr/lib/llvm-24/lib/clang/24/lib/linux/libclang_rt.fuzzer-x86_64.a v8/third_party/llvm-build/Release+Asserts/lib/clang/24/lib/x86_64-unknown-linux-gnu/libclang_rt.fuzzer.a
+```
+
+`dpkg -L libclang-rt-24-dev | grep fuzzer` shows the file's path if it differs. This was tested with V8 12.5, whose Clang is version 19, and Debian's `libclang-rt-19-dev`. Debian has no LLVM 24 package for V8 15.8's Clang, so build the runtime from source there.
+
+#### From source
 
 Download only libFuzzer's source at that commit:
 
